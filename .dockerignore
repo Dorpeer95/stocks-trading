@@ -1,0 +1,48 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.egg-info
+dist
+build
+
+# Virtual environments
+.venv
+venv
+env
+
+# Environment / secrets
+.env
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs
+*.log
+
+# ML models (downloaded at runtime from Supabase)
+models/*.pkl
+models/*.joblib
+
+# Documentation (not needed in image)
+docs
+DEVELOPMENT_PLAN.md
+README.md
+
+# CI/CD
+.github
+
+# Jupyter
+.ipynb_checkpoints

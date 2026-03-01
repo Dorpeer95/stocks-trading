@@ -1,0 +1,48 @@
+# stocks-agent requirements
+# Pinned versions for reproducibility
+
+# Core
+fastapi==0.109.0
+uvicorn==0.27.0
+python-dotenv==1.0.1
+
+# Data
+yfinance==0.2.36
+pandas==2.2.0
+numpy==1.26.3
+
+# Technical Analysis
+ta==0.11.0
+
+# Machine Learning
+xgboost==2.0.3
+scikit-learn==1.4.0
+joblib==1.3.2
+
+# Database
+supabase==2.3.4
+postgrest==0.16.1
+
+# Telegram
+python-telegram-bot==20.7
+
+# AI / NLP
+openai==1.12.0
+vaderSentiment==3.3.2
+
+# News
+newsapi-python==0.2.7
+
+# Scheduling
+apscheduler==3.10.4
+pytz==2024.1
+
+# HTTP
+httpx==0.27.0
+
+# Monitoring
+psutil==5.9.8
+
+# Utilities
+beautifulsoup4==4.12.3
+lxml==5.1.0
