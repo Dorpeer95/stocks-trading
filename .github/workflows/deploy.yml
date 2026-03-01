@@ -1,164 +1,26 @@
-name: Deploy stocks-agent
+name: Deploy to DigitalOcean
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
-
-env:
-  SERVICE_NAME: algotrading-stocks
-  DEPLOY_DIR: /home/algotrading/stocks-agent
-  PYTHON_VERSION: "3.11"
+    branches: [ main ]
 
 jobs:
-  # ---------------------------------------------------------------
-  # Job 1: Lint & validate
-  # ---------------------------------------------------------------
-  validate:
-    name: Validate
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Check syntax (all .py files)
-        run: |
-          python -m py_compile main.py
-          python -m py_compile health.py
-          find agent/ utils/ -name "*.py" -exec python -m py_compile {} +
-          echo "✅ All Python files compile successfully"
-
-      - name: Verify imports
-        run: |
-          python -c "
-          from agent.agent import AgentLoop
-          from agent.scanner import scan_universe
-          from agent.scorer import score_candidates
-          from agent.events import detect_and_persist_events
-          from agent.portfolio import get_portfolio_summary
-          from agent.persistence import init_supabase
-          from agent.ai_model import ModelManager
-          from agent.feature_config import DIRECTION_FEATURES
-          from utils.data_loader import fetch_sp500_list
-          from utils.indicators import calc_all_indicators
-          from utils.telegram_bot import send_alert
-          from utils.scheduler import MarketScheduler
-          from utils.sentiment import CostTracker, vader_score
-          from utils.position_sizing import full_position_plan
-          from utils.sectors import rank_sectors
-          from utils.earnings import fetch_earnings_dates
-          from utils.insider import fetch_insider_transactions
-          from health import app
-          print('✅ All imports verified')
-          "
-
-      - name: Validate Dockerfile syntax
-        run: |
-          docker build --check . 2>/dev/null || echo "Docker syntax check skipped (no BuildKit)"
-
-  # ---------------------------------------------------------------
-  # Job 2: Deploy to DigitalOcean
-  # ---------------------------------------------------------------
   deploy:
-    name: Deploy to DigitalOcean
     runs-on: ubuntu-latest
-    needs: validate
-    if: github.ref == 'refs/heads/main'
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
+      - name: Deploy to droplet
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DO_HOST }}
           username: ${{ secrets.DO_USERNAME }}
           key: ${{ secrets.DO_SSH_KEY }}
-          command_timeout: 5m
           script: |
-            set -e
-
-            echo "=== Deploying stocks-agent ==="
-            cd ${{ env.DEPLOY_DIR }}
-
-            # Save current commit for rollback
-            PREV_COMMIT=$(git rev-parse HEAD)
-            echo "Previous commit: ${PREV_COMMIT}"
-
-            # Pull latest code
+            cd /home/algotrading/stocks-agent
             git pull origin main
-            NEW_COMMIT=$(git rev-parse HEAD)
-            echo "New commit: ${NEW_COMMIT}"
-
-            if [ "${PREV_COMMIT}" = "${NEW_COMMIT}" ]; then
-              echo "No changes to deploy"
-              exit 0
-            fi
-
-            # Activate virtual environment
-            source venv/bin/activate
-
-            # Install/update dependencies
-            pip install -r requirements.txt --quiet
-
-            # Verify imports on server
-            python -c "from agent.agent import AgentLoop; print('✅ Imports OK')"
-
-            # Restart the service
-            sudo systemctl restart ${{ env.SERVICE_NAME }}
-
-            # Wait and check status
-            sleep 8
-            if sudo systemctl is-active --quiet ${{ env.SERVICE_NAME }}; then
-              echo "✅ Service is running"
-            else
-              echo "❌ Service failed to start — rolling back"
-              git checkout ${PREV_COMMIT}
-              pip install -r requirements.txt --quiet
-              sudo systemctl restart ${{ env.SERVICE_NAME }}
-              sleep 5
-              if sudo systemctl is-active --quiet ${{ env.SERVICE_NAME }}; then
-                echo "⚠️  Rolled back to ${PREV_COMMIT}"
-              else
-                echo "❌ Rollback also failed"
-                sudo journalctl -u ${{ env.SERVICE_NAME }} --no-pager -n 30
-              fi
-              exit 1
-            fi
-
-            # Health check with retry
-            HEALTH_OK=false
-            for i in 1 2 3; do
-              sleep 5
-              if curl -sf http://localhost:8001/health > /dev/null; then
-                HEALTH_OK=true
-                echo "✅ Health check passed (attempt ${i})"
-                break
-              fi
-              echo "⏳ Health check attempt ${i}/3 failed, retrying..."
-            done
-
-            if [ "${HEALTH_OK}" = "false" ]; then
-              echo "⚠️  Health check failed after 3 attempts"
-              echo "Service is running but health endpoint not ready"
-              sudo journalctl -u ${{ env.SERVICE_NAME }} --no-pager -n 15
-            fi
-
-            # Show deployment info
-            echo ""
-            echo "=== Deploy complete ==="
-            echo "Commit: ${NEW_COMMIT}"
-            echo "Memory: $(ps -o rss= -p $(pgrep -f 'python main.py' | head -1) 2>/dev/null | awk '{printf "%.0f MB", $1/1024}' 2>/dev/null || echo 'N/A')"
+            venv/bin/pip install -r requirements.txt -q
+            systemctl restart algotrading-stocks
+            sleep 3
+            systemctl is-active algotrading-stocks
