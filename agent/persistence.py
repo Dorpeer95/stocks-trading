@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from supabase import Client, create_client
+from supabase.lib.client_options import ClientOptions
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,8 @@ def init_supabase() -> Client:
     """Initialise and return the Supabase client (singleton).
 
     Reads ``STOCKS_SUPABASE_URL`` and ``STOCKS_SUPABASE_KEY``
-    from the environment.
+    from the environment.  The client is configured with
+    ``schema='stocks'`` so all table references go to the correct schema.
 
     Raises
     ------
@@ -44,8 +46,9 @@ def init_supabase() -> Client:
             "STOCKS_SUPABASE_URL and STOCKS_SUPABASE_KEY must be set"
         )
 
-    _client = create_client(url, key)
-    logger.info("Supabase client initialised")
+    # supabase-py v2: pass schema via ClientOptions (no .schema() method)
+    _client = create_client(url, key, options=ClientOptions(schema="stocks"))
+    logger.info("Supabase client initialised (schema=stocks)")
     return _client
 
 
@@ -57,13 +60,12 @@ def _get_client() -> Client:
 
 
 # ---------------------------------------------------------------------------
-# Helper: table reference with schema
+# Helper: table reference
 # ---------------------------------------------------------------------------
 
 def _table(name: str) -> Any:
-    """Return a table reference in the ``stocks`` schema."""
-    client = _get_client()
-    return client.schema("stocks").table(name)
+    """Return a table reference.  Schema is set at client-init time."""
+    return _get_client().table(name)
 
 
 # ---------------------------------------------------------------------------
