@@ -1,0 +1,6 @@
+# render.yaml — Legacy/backup deploy config (placeholder)
+# Primary deployment target is DigitalOcean.
+# See scripts/deploy.sh and .github/workflows/deploy.yml.
+#
+# This file is a placeholder per DEVELOPMENT_PLAN.md.
+# Not actively used in V1.

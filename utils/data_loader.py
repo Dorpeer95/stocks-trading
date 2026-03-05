@@ -6,10 +6,11 @@ All public functions return ``None`` on failure.
 """
 
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -105,9 +106,24 @@ def fetch_sp500_list() -> Optional[List[Dict[str, str]]]:
         logger.debug("fetch_sp500_list: returning cached")
         return cached
 
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
-    df = tables[0]
+    try:
+        import urllib.request
+        import ssl
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+        )
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(req, context=ctx) as response:
+            html = response.read()
+        tables = pd.read_html(html)
+        df = tables[0]
+    except Exception as e:
+        logger.error(f"Failed to fetch S&P 500 list from Wikipedia: {e}")
+        return None
 
     # Wikipedia table columns may change; handle common variants
     col_map = {
@@ -130,7 +146,7 @@ def fetch_sp500_list() -> Optional[List[Dict[str, str]]]:
         return None
 
     # Clean tickers (e.g. BRK.B → BRK-B for yfinance)
-    df["ticker"] = df["ticker"].str.replace(".", "-", regex=False)
+    df["ticker"] = df["ticker"].apply(lambda x: str(x).replace(".", "-"))
 
     result = df[["ticker", "company_name", "sector", "industry"]].to_dict(
         orient="records"
@@ -145,38 +161,94 @@ def fetch_sp500_list() -> Optional[List[Dict[str, str]]]:
 # Price data
 # ---------------------------------------------------------------------------
 
+from alpaca_trade_api.rest import REST, TimeFrame
+
+# Init Alpaca REST client (needs ALPACAS_API_KEY and ALPACA_SECRET_KEY in env)
+_alpaca_key = os.getenv("ALPACA_API_KEY", "")
+_alpaca_secret = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACAS_REST = REST(_alpaca_key, _alpaca_secret) if _alpaca_key else None
+
+def _yfinance_period_to_dates(period: str) -> Tuple[str, str]:
+    """Convert yfinance period strings (1mo, 1y) to (start_date, end_date) for Alpaca."""
+    end_date = datetime.now()
+    if period == "1mo":
+        start_date = end_date - timedelta(days=30)
+    elif period == "3mo":
+        start_date = end_date - timedelta(days=90)
+    elif period == "6mo":
+        start_date = end_date - timedelta(days=180)
+    elif period == "1y":
+        start_date = end_date - timedelta(days=365)
+    elif period == "2y":
+        start_date = end_date - timedelta(days=730)
+    elif period == "5y":
+        start_date = end_date - timedelta(days=365*5)
+    else:
+        # Default 1 year
+        start_date = end_date - timedelta(days=365)
+        
+    # Alpaca expects YYYY-MM-DD
+    return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+
+
 @_retry(max_retries=3)
 def fetch_price_data(
     ticker: str,
     period: str = "1y",
     interval: str = "1d",
 ) -> Optional[pd.DataFrame]:
-    """Fetch OHLCV price data for a single ticker.
+    """Fetch OHLCV price data for a single ticker via Alpaca.
 
     Parameters
     ----------
     ticker : Stock symbol (e.g. ``'AAPL'``).
     period : yfinance period string (``'1d'``, ``'5d'``, ``'1mo'``, ``'1y'``, etc.).
-    interval : Bar interval (``'1d'``, ``'1h'``, etc.).
+    interval : Bar interval (``'1d'``, ``'1h'``, etc.).  Currently forced to TimeFrame.Day.
 
     Returns
     -------
     DataFrame with ``Open, High, Low, Close, Volume`` columns,
     or ``None`` on failure.
     """
-    cache_key = _cache_key("price", ticker, period, interval)
+    cache_key = _cache_key("price_alpaca", ticker, period, interval)
     cached = _get_cached(cache_key)
     if cached is not None:
         return cached
 
-    t = yf.Ticker(ticker)
-    df = t.history(period=period, interval=interval)
+    if not ALPACAS_REST:
+        logger.error("Alpaca keys missing! Set ALPACA_API_KEY and ALPACA_SECRET_KEY.")
+        return None
 
-    if df is None or df.empty:
+    # Alpaca handles . symbols properly usually, but standard is sometimes replacing with hyphen or preserving.
+    # We will query exactly what's requested, but if it fails we could try replacements.
+    start, end = _yfinance_period_to_dates(period)
+    
+    try:
+        bars = ALPACAS_REST.get_bars(
+            ticker,
+            TimeFrame.Day,
+            start=start,
+            end=end,
+            adjustment='all'
+        ).df
+    except Exception as e:
+        logger.error(f"Alpaca get_bars failed for {ticker}: {e}")
+        return None
+
+    if bars is None or bars.empty:
         logger.warning(f"No price data for {ticker}")
         return None
 
-    # Standardise column names (yfinance sometimes adds extras)
+    # Rename columns to match what indicators/pipeline expect
+    df = bars.rename(columns={
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume"
+    })
+
+    # Standardise column names
     keep_cols = ["Open", "High", "Low", "Close", "Volume"]
     available = [c for c in keep_cols if c in df.columns]
     df = df[available].copy()
@@ -199,9 +271,7 @@ def fetch_batch_prices(
     period: str = "1y",
     interval: str = "1d",
 ) -> Optional[Dict[str, pd.DataFrame]]:
-    """Batch-download OHLCV data for many tickers in one API call.
-
-    Uses ``yf.download`` for efficiency (single HTTP request).
+    """Batch-download OHLCV data for many tickers in one API call via Alpaca.
 
     Returns
     -------
@@ -211,47 +281,55 @@ def fetch_batch_prices(
     if not tickers:
         return {}
 
-    cache_key = _cache_key("batch", ",".join(sorted(tickers)), period)
+    cache_key = _cache_key("batch_alpaca", ",".join(sorted(tickers)), period)
     cached = _get_cached(cache_key)
     if cached is not None:
         return cached
 
-    logger.info(
-        f"Batch downloading {len(tickers)} tickers, period={period}"
-    )
+    if not ALPACAS_REST:
+        logger.error("Alpaca keys missing! Set ALPACA_API_KEY and ALPACA_SECRET_KEY.")
+        return None
 
-    data = yf.download(
-        tickers=tickers,
-        period=period,
-        interval=interval,
-        group_by="ticker",
-        threads=True,
-        progress=False,
-    )
+    logger.info(f"Batch downloading {len(tickers)} tickers via Alpaca, period={period}")
+    start, end = _yfinance_period_to_dates(period)
+    
+    try:
+        bars = ALPACAS_REST.get_bars(
+            tickers,
+            TimeFrame.Day,
+            start=start,
+            end=end,
+            adjustment='all'
+        ).df
+    except Exception as e:
+        logger.error(f"Alpaca batch get_bars failed: {e}")
+        return None
 
-    if data is None or data.empty:
+    if bars is None or bars.empty:
         logger.error("Batch download returned empty data")
         return None
 
     result: Dict[str, pd.DataFrame] = {}
 
-    if len(tickers) == 1:
-        # yf.download with 1 ticker returns flat columns
-        ticker = tickers[0]
-        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in data.columns]
-        df = data[keep].dropna(subset=["Close"] if "Close" in keep else [])
-        if not df.empty:
-            result[ticker] = df
-    else:
+    # Group by stock symbol. Alpaca multi-ticker df has a 'symbol' MultiIndex or column,
+    # but using .df typically puts 'symbol' as the second level of index or a column.
+    if "symbol" in bars.index.names:
         for ticker in tickers:
             try:
-                if ticker not in data.columns.get_level_values(0):
-                    continue
-                df = data[ticker].copy()
-                keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-                df = df[keep].dropna(subset=["Close"] if "Close" in keep else [])
+                if ticker in bars.index.get_level_values("symbol"):
+                    df = bars.xs(ticker, level="symbol").copy()
+                    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+                    result[ticker] = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+            except Exception as e:
+                logger.warning(f"Failed to extract {ticker} from batch: {e}")
+    else:
+        # If flat column 'symbol'
+        for ticker in tickers:
+            try:
+                df = bars[bars["symbol"] == ticker].copy()
                 if not df.empty:
-                    result[ticker] = df
+                    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+                    result[ticker] = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
             except Exception as e:
                 logger.warning(f"Failed to extract {ticker} from batch: {e}")
 
@@ -334,16 +412,17 @@ def fetch_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
     ``earnings_date``, ``dividend_yield``, ``revenue_growth``,
     ``profit_margin``.
     """
-    cache_key = _cache_key("fundamentals", ticker)
+    cache_key = _cache_key("fundamentals_v2", ticker)
     cached = _get_cached(cache_key)
     if cached is not None:
         return cached
 
     try:
         t = yf.Ticker(ticker)
+        # yfinance t.info is slow and hits 429s. We cache this for 7 days.
         info = t.info
 
-        if not info or info.get("regularMarketPrice") is None:
+        if not info:
             logger.warning(f"No fundamental data for {ticker}")
             return None
 
@@ -351,7 +430,6 @@ def fetch_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
         market_cap_b = round(market_cap / 1e9, 2) if market_cap else None
 
         result = {
-            "ticker": ticker,
             "market_cap_b": market_cap_b,
             "pe_ratio": info.get("trailingPE"),
             "forward_pe": info.get("forwardPE"),
@@ -362,25 +440,24 @@ def fetch_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
             "dividend_yield": info.get("dividendYield"),
             "revenue_growth": info.get("revenueGrowth"),
             "profit_margin": info.get("profitMargins"),
+            "earnings_date": None,
         }
 
-        # Earnings date
+        # Try to get earnings date from calendar
         try:
             calendar = t.calendar
             if calendar is not None and not calendar.empty:
                 if "Earnings Date" in calendar.index:
-                    result["earnings_date"] = str(calendar.loc["Earnings Date"].iloc[0])
-                elif isinstance(calendar, dict) and "Earnings Date" in calendar:
-                    dates = calendar["Earnings Date"]
-                    result["earnings_date"] = str(dates[0]) if dates else None
-                else:
-                    result["earnings_date"] = None
-            else:
-                result["earnings_date"] = None
+                    dates = calendar.loc["Earnings Date"]
+                    if isinstance(dates, (list, pd.Series, np.ndarray)):
+                        result["earnings_date"] = str(dates[0])
+                    else:
+                        result["earnings_date"] = str(dates)
         except Exception:
-            result["earnings_date"] = None
+            pass
 
-        _set_cached(cache_key, result, ttl=3600)  # 1 hour cache
+        # Cache for 7 days (604800 seconds)
+        _set_cached(cache_key, result, ttl=604800)
         logger.debug(f"Fetched fundamentals for {ticker}")
         return result
 

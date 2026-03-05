@@ -146,7 +146,7 @@ def _prepare_direction_data(
     labels_list: List[int] = []
 
     # Download in batches
-    batch_size = 25
+    batch_size = 10
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
         logger.info(f"  Batch {i // batch_size + 1}: {len(batch)} tickers")
@@ -239,7 +239,7 @@ def _prepare_volatility_data(
     features_list: List[np.ndarray] = []
     labels_list: List[int] = []
 
-    batch_size = 25
+    batch_size = 10
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
         batch_data = fetch_batch_prices(batch, period=period)

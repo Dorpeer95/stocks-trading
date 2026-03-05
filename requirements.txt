@@ -46,3 +46,4 @@ psutil==5.9.8
 # Utilities
 beautifulsoup4==4.12.3
 lxml==5.1.0
+alpaca-trade-api==3.2.0

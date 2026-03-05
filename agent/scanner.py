@@ -41,8 +41,8 @@ ENABLE_ML_FILTER = os.getenv("STOCKS_ENABLE_ML_FILTER", "true").lower() == "true
 ML_DIRECTION_THRESHOLD = float(os.getenv("STOCKS_ML_DIRECTION_THRESHOLD", "0.45"))
 
 # Batch download chunk size (stay under yfinance rate limits)
-BATCH_SIZE = 50
-BATCH_DELAY = 2.0  # seconds between batches
+BATCH_SIZE = 20
+BATCH_DELAY = 5.0  # seconds between batches
 
 
 # ---------------------------------------------------------------------------
