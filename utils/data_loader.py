@@ -197,72 +197,50 @@ def fetch_price_data(
     period: str = "1y",
     interval: str = "1d",
 ) -> Optional[pd.DataFrame]:
-    """Fetch OHLCV price data for a single ticker via Alpaca.
+    """Fetch OHLCV price data for a single ticker.
 
-    Parameters
-    ----------
-    ticker : Stock symbol (e.g. ``'AAPL'``).
-    period : yfinance period string (``'1d'``, ``'5d'``, ``'1mo'``, ``'1y'``, etc.).
-    interval : Bar interval (``'1d'``, ``'1h'``, etc.).  Currently forced to TimeFrame.Day.
-
-    Returns
-    -------
-    DataFrame with ``Open, High, Low, Close, Volume`` columns,
-    or ``None`` on failure.
+    Uses Alpaca if keys are configured, otherwise falls back to yfinance.
     """
-    cache_key = _cache_key("price_alpaca", ticker, period, interval)
+    cache_key = _cache_key("price_data", ticker, period, interval)
     cached = _get_cached(cache_key)
     if cached is not None:
         return cached
 
-    if not ALPACAS_REST:
-        logger.error("Alpaca keys missing! Set ALPACA_API_KEY and ALPACA_SECRET_KEY.")
-        return None
+    # --- Try Alpaca first ---
+    if ALPACAS_REST:
+        start, end = _yfinance_period_to_dates(period)
+        try:
+            bars = ALPACAS_REST.get_bars(
+                ticker, TimeFrame.Day, start=start, end=end, adjustment='all'
+            ).df
+            if bars is not None and not bars.empty:
+                df = bars.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+                keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                df = df[keep_cols].dropna(subset=["Close"])
+                if not df.empty:
+                    _set_cached(cache_key, df)
+                    logger.debug(f"Fetched price data for {ticker} via Alpaca: {len(df)} bars")
+                    return df
+        except Exception as e:
+            logger.warning(f"Alpaca price fetch failed for {ticker}: {e} — falling back to yfinance")
 
-    # Alpaca handles . symbols properly usually, but standard is sometimes replacing with hyphen or preserving.
-    # We will query exactly what's requested, but if it fails we could try replacements.
-    start, end = _yfinance_period_to_dates(period)
-    
+    # --- Fallback: yfinance ---
     try:
-        bars = ALPACAS_REST.get_bars(
-            ticker,
-            TimeFrame.Day,
-            start=start,
-            end=end,
-            adjustment='all'
-        ).df
+        t = yf.Ticker(ticker)
+        df = t.history(period=period, interval=interval)
+        if df is None or df.empty:
+            logger.warning(f"yfinance: no data for {ticker}")
+            return None
+        keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        df = df[keep_cols].dropna(subset=["Close"])
+        if df.empty:
+            return None
+        _set_cached(cache_key, df)
+        logger.debug(f"Fetched price data for {ticker} via yfinance: {len(df)} bars")
+        return df
     except Exception as e:
-        logger.error(f"Alpaca get_bars failed for {ticker}: {e}")
+        logger.error(f"fetch_price_data failed for {ticker}: {e}")
         return None
-
-    if bars is None or bars.empty:
-        logger.warning(f"No price data for {ticker}")
-        return None
-
-    # Rename columns to match what indicators/pipeline expect
-    df = bars.rename(columns={
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close",
-        "volume": "Volume"
-    })
-
-    # Standardise column names
-    keep_cols = ["Open", "High", "Low", "Close", "Volume"]
-    available = [c for c in keep_cols if c in df.columns]
-    df = df[available].copy()
-
-    # Drop rows where Close is NaN
-    df = df.dropna(subset=["Close"])
-
-    if df.empty:
-        logger.warning(f"Price data for {ticker} was all NaN")
-        return None
-
-    _set_cached(cache_key, df)
-    logger.debug(f"Fetched price data for {ticker}: {len(df)} bars")
-    return df
 
 
 @_retry(max_retries=3)
@@ -271,71 +249,83 @@ def fetch_batch_prices(
     period: str = "1y",
     interval: str = "1d",
 ) -> Optional[Dict[str, pd.DataFrame]]:
-    """Batch-download OHLCV data for many tickers in one API call via Alpaca.
+    """Batch-download OHLCV data for many tickers.
 
-    Returns
-    -------
-    Dict mapping ticker → DataFrame, or ``None`` on failure.
-    Tickers that failed silently are omitted from the result.
+    Uses Alpaca if keys are configured, otherwise falls back to yfinance.
+    Returns dict mapping ticker → DataFrame, or ``None`` on failure.
     """
     if not tickers:
         return {}
 
-    cache_key = _cache_key("batch_alpaca", ",".join(sorted(tickers)), period)
+    cache_key = _cache_key("batch_prices", ",".join(sorted(tickers)), period)
     cached = _get_cached(cache_key)
     if cached is not None:
         return cached
 
-    if not ALPACAS_REST:
-        logger.error("Alpaca keys missing! Set ALPACA_API_KEY and ALPACA_SECRET_KEY.")
-        return None
+    # --- Try Alpaca first ---
+    if ALPACAS_REST:
+        start, end = _yfinance_period_to_dates(period)
+        try:
+            bars = ALPACAS_REST.get_bars(
+                tickers, TimeFrame.Day, start=start, end=end, adjustment='all'
+            ).df
+            if bars is not None and not bars.empty:
+                result: Dict[str, pd.DataFrame] = {}
+                if "symbol" in bars.index.names:
+                    for ticker in tickers:
+                        try:
+                            if ticker in bars.index.get_level_values("symbol"):
+                                df = bars.xs(ticker, level="symbol").copy()
+                                df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+                                result[ticker] = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+                        except Exception as e:
+                            logger.warning(f"Failed to extract {ticker} from Alpaca batch: {e}")
+                if result:
+                    logger.info(f"Batch download via Alpaca: {len(result)}/{len(tickers)} tickers OK")
+                    _set_cached(cache_key, result)
+                    return result
+        except Exception as e:
+            logger.warning(f"Alpaca batch download failed: {e} — falling back to yfinance")
 
-    logger.info(f"Batch downloading {len(tickers)} tickers via Alpaca, period={period}")
-    start, end = _yfinance_period_to_dates(period)
-    
+    # --- Fallback: yfinance batch download ---
+    logger.info(f"Batch downloading {len(tickers)} tickers via yfinance, period={period}")
     try:
-        bars = ALPACAS_REST.get_bars(
+        raw = yf.download(
             tickers,
-            TimeFrame.Day,
-            start=start,
-            end=end,
-            adjustment='all'
-        ).df
-    except Exception as e:
-        logger.error(f"Alpaca batch get_bars failed: {e}")
-        return None
+            period=period,
+            interval=interval,
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+        if raw is None or raw.empty:
+            logger.error("yfinance batch download returned empty data")
+            return None
 
-    if bars is None or bars.empty:
-        logger.error("Batch download returned empty data")
-        return None
-
-    result: Dict[str, pd.DataFrame] = {}
-
-    # Group by stock symbol. Alpaca multi-ticker df has a 'symbol' MultiIndex or column,
-    # but using .df typically puts 'symbol' as the second level of index or a column.
-    if "symbol" in bars.index.names:
+        result = {}
         for ticker in tickers:
             try:
-                if ticker in bars.index.get_level_values("symbol"):
-                    df = bars.xs(ticker, level="symbol").copy()
-                    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
-                    result[ticker] = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
-            except Exception as e:
-                logger.warning(f"Failed to extract {ticker} from batch: {e}")
-    else:
-        # If flat column 'symbol'
-        for ticker in tickers:
-            try:
-                df = bars[bars["symbol"] == ticker].copy()
+                if len(tickers) == 1:
+                    df = raw.copy()
+                else:
+                    df = raw[ticker].copy() if ticker in raw.columns.get_level_values(0) else None
+                if df is None or df.empty:
+                    continue
+                keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                df = df[keep].dropna(subset=["Close"])
                 if not df.empty:
-                    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
-                    result[ticker] = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+                    result[ticker] = df
             except Exception as e:
-                logger.warning(f"Failed to extract {ticker} from batch: {e}")
+                logger.warning(f"Failed to extract {ticker} from yfinance batch: {e}")
 
-    logger.info(f"Batch download complete: {len(result)}/{len(tickers)} tickers OK")
-    _set_cached(cache_key, result)
-    return result
+        logger.info(f"Batch download via yfinance: {len(result)}/{len(tickers)} tickers OK")
+        if result:
+            _set_cached(cache_key, result)
+        return result if result else None
+    except Exception as e:
+        logger.error(f"fetch_batch_prices yfinance fallback failed: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------

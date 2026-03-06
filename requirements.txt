@@ -7,7 +7,7 @@ uvicorn==0.27.0
 python-dotenv==1.0.1
 
 # Data
-yfinance==0.2.36
+yfinance==1.2.0
 pandas==2.2.0
 numpy==1.26.3
 

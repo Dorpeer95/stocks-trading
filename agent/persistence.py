@@ -73,18 +73,7 @@ def _table(name: str) -> Any:
 # ---------------------------------------------------------------------------
 
 def upsert_universe(stocks: List[Dict[str, Any]]) -> bool:
-    """Upsert S&P 500 constituents into ``stocks.universe``.
-
-    Parameters
-    ----------
-    stocks : List of dicts with keys ``ticker``, ``company_name``,
-             ``sector``, ``industry`` and optionally ``market_cap_b``,
-             ``avg_volume_50d``.
-
-    Returns
-    -------
-    ``True`` on success, ``False`` on failure.
-    """
+    """Upsert S&P 500 constituents into ``stocks.universe``."""
     if not stocks:
         logger.warning("upsert_universe: empty list")
         return False
@@ -94,12 +83,10 @@ def upsert_universe(stocks: List[Dict[str, Any]]) -> bool:
         for s in stocks:
             rows.append({
                 "ticker": s["ticker"],
-                "company_name": s["company_name"],
-                "sector": s["sector"],
-                "industry": s["industry"],
-                "market_cap_b": s.get("market_cap_b"),
-                "avg_volume_50d": s.get("avg_volume_50d"),
-                "in_sp500": True,
+                "company_name": s.get("company_name", s.get("shortName", "")),
+                "sector": s.get("sector", ""),
+                "industry": s.get("industry", ""),
+                "market_cap": s.get("market_cap") or s.get("market_cap_b"),
                 "is_active": True,
                 "updated_at": now,
             })
@@ -122,29 +109,41 @@ def upsert_universe(stocks: List[Dict[str, Any]]) -> bool:
 def insert_daily_scores(scores: List[Dict[str, Any]]) -> bool:
     """Batch-insert daily scores for all scanned stocks.
 
-    Parameters
-    ----------
-    scores : List of dicts matching the ``stocks.daily_scores`` schema.
-
-    Returns
-    -------
-    ``True`` on success, ``False`` on failure.
+    Translates bot field names to actual Supabase column names.
     """
     if not scores:
         logger.warning("insert_daily_scores: empty list")
         return False
     try:
+        rows = [_map_daily_score(s) for s in scores]
         # Batch in chunks of 100 to avoid payload size limits
         chunk_size = 100
-        for i in range(0, len(scores), chunk_size):
-            chunk = scores[i : i + chunk_size]
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i : i + chunk_size]
             _table("daily_scores").insert(chunk).execute()
-
-        logger.info(f"Inserted {len(scores)} daily scores")
+        logger.info(f"Inserted {len(rows)} daily scores")
         return True
     except Exception as e:
         logger.error(f"insert_daily_scores failed: {e}", exc_info=True)
         return False
+
+
+def _map_daily_score(s: Dict[str, Any]) -> Dict[str, Any]:
+    """Map bot daily-score fields → Supabase column names."""
+    sub = s.get("sub_scores", {})
+    return {
+        "ticker": s.get("ticker"),
+        "score_date": s.get("score_date"),
+        "confidence": s.get("confidence") or s.get("total_score"),
+        "technical_score": s.get("technical_score") or sub.get("technical"),
+        "rs_score": s.get("rs_score") or sub.get("relative_strength"),
+        "fundamental_score": s.get("fundamental_score") or sub.get("fundamental"),
+        "sentiment_score": s.get("sentiment_score") or sub.get("sentiment"),
+        "insider_score": sub.get("insider"),
+        "macro_score": sub.get("macro"),
+        "ml_score": sub.get("ml"),
+        "setup_type": s.get("setup_type"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -154,16 +153,11 @@ def insert_daily_scores(scores: List[Dict[str, Any]]) -> bool:
 def insert_opportunity(opp: Dict[str, Any]) -> bool:
     """Insert a new trade opportunity.
 
-    Parameters
-    ----------
-    opp : Dict matching the ``stocks.opportunities`` schema.
-
-    Returns
-    -------
-    ``True`` on success, ``False`` on failure.
+    Translates bot output fields to the actual Supabase column names.
     """
     try:
-        _table("opportunities").insert(opp).execute()
+        row = _map_opportunity(opp)
+        _table("opportunities").insert(row).execute()
         logger.info(
             f"Inserted opportunity: {opp.get('ticker')} "
             f"confidence={opp.get('confidence')}"
@@ -174,13 +168,40 @@ def insert_opportunity(opp: Dict[str, Any]) -> bool:
         return False
 
 
+def _map_opportunity(opp: Dict[str, Any]) -> Dict[str, Any]:
+    """Map bot opportunity fields → Supabase column names."""
+    reasons = opp.get("reasons", [])
+    notes = "; ".join(reasons[:5]) if reasons else opp.get("notes", "")
+    # Average entry_price_low/high → single entry_price
+    entry_low = opp.get("entry_price_low", 0) or 0
+    entry_high = opp.get("entry_price_high", 0) or 0
+    entry_price = opp.get("entry_price") or (
+        round((entry_low + entry_high) / 2, 2) if entry_low and entry_high else entry_low
+    )
+    return {
+        "ticker": opp.get("ticker"),
+        "scan_date": opp.get("scan_date") or opp.get("score_date"),
+        "confidence": opp.get("confidence"),
+        "setup_type": opp.get("setup_type"),
+        "entry_price": entry_price,
+        "stop_loss": opp.get("stop_loss"),
+        "target_price": opp.get("target_price"),
+        "risk_reward": opp.get("risk_reward_ratio") or opp.get("risk_reward"),
+        "position_size": opp.get("shares") or opp.get("position_size"),
+        "atr": opp.get("atr"),
+        "notes": notes,
+        "acted_on": False,
+    }
+
+
 def insert_opportunities(opps: List[Dict[str, Any]]) -> bool:
     """Batch-insert multiple opportunities."""
     if not opps:
         return True
     try:
-        _table("opportunities").insert(opps).execute()
-        logger.info(f"Inserted {len(opps)} opportunities")
+        rows = [_map_opportunity(o) for o in opps]
+        _table("opportunities").insert(rows).execute()
+        logger.info(f"Inserted {len(rows)} opportunities")
         return True
     except Exception as e:
         logger.error(f"insert_opportunities failed: {e}", exc_info=True)
@@ -272,10 +293,23 @@ def update_position(position_id: str, updates: Dict[str, Any]) -> bool:
 def insert_trade(trade: Dict[str, Any]) -> bool:
     """Insert a closed trade record."""
     try:
-        _table("trades").insert(trade).execute()
+        row = {
+            "ticker": trade.get("ticker"),
+            "entry_date": trade.get("entry_date"),
+            "exit_date": trade.get("exit_date"),
+            "entry_price": trade.get("entry_price"),
+            "exit_price": trade.get("exit_price"),
+            "shares": trade.get("shares"),
+            "pnl": trade.get("realized_pnl") or trade.get("pnl"),
+            "pnl_pct": trade.get("realized_pnl_pct") or trade.get("pnl_pct"),
+            "exit_reason": trade.get("exit_reason"),
+            "setup_type": trade.get("setup_type"),
+            "hold_days": trade.get("hold_days") or trade.get("days_held"),
+        }
+        _table("trades").insert(row).execute()
         logger.info(
             f"Inserted trade: {trade.get('ticker')} "
-            f"pnl={trade.get('realized_pnl')}"
+            f"pnl={row.get('pnl')}"
         )
         return True
     except Exception as e:
@@ -306,7 +340,17 @@ def get_trade_history(limit: int = 50) -> List[Dict[str, Any]]:
 def insert_event(event: Dict[str, Any]) -> bool:
     """Insert a detected market event."""
     try:
-        _table("market_events").insert(event).execute()
+        data_payload = event.get("data", {})
+        row = {
+            "event_date": event.get("event_date") or date.today().isoformat(),
+            "event_type": event.get("event_type"),
+            "severity": event.get("severity", "low"),
+            "description": event.get("description") or event.get("event_detail"),
+            "vix_level": data_payload.get("vix") if isinstance(data_payload, dict) else None,
+            "spy_change_pct": data_payload.get("spy_change_pct") if isinstance(data_payload, dict) else None,
+            "regime": data_payload.get("regime") if isinstance(data_payload, dict) else None,
+        }
+        _table("market_events").insert(row).execute()
         logger.info(
             f"Inserted event: {event.get('event_type')} "
             f"severity={event.get('severity')}"
@@ -341,10 +385,18 @@ def get_recent_events(days: int = 7) -> List[Dict[str, Any]]:
 def insert_equity_snapshot(snapshot: Dict[str, Any]) -> bool:
     """Insert a weekly equity/portfolio snapshot."""
     try:
-        _table("equity_snapshots").insert(snapshot).execute()
+        row = {
+            "snapshot_date": snapshot.get("snapshot_date"),
+            "portfolio_value": snapshot.get("total_value") or snapshot.get("portfolio_value"),
+            "cash": snapshot.get("cash"),
+            "open_positions": snapshot.get("positions_count") or snapshot.get("open_positions"),
+            "daily_pnl": snapshot.get("daily_pnl"),
+            "total_pnl": snapshot.get("unrealized_pnl") or snapshot.get("total_pnl"),
+        }
+        _table("equity_snapshots").insert(row).execute()
         logger.info(
             f"Inserted equity snapshot: "
-            f"total={snapshot.get('total_value')}"
+            f"portfolio_value={row.get('portfolio_value')}"
         )
         return True
     except Exception as e:
