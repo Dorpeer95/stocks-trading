@@ -347,9 +347,14 @@ def can_open_position(position_value: float) -> Tuple[bool, str]:
 def execute_buy_opportunities(opportunities: List[Dict[str, Any]]) -> None:
     """Attempt to autonomously open positions for top opportunities using Alpaca."""
     for opp in opportunities:
-        position_value = opp.get("suggested_position_size", 0)
-        shares = opp.get("suggested_shares", 0)
+        position_value = opp.get("position_size_usd", 0)
+        shares = opp.get("shares", 0)
         ticker = opp.get("ticker")
+        
+        # Fallback if keys are missing (e.g. from older data)
+        if shares <= 0:
+            position_value = opp.get("suggested_position_size", 0)
+            shares = opp.get("suggested_shares", 0)
         
         if not ticker or shares <= 0:
             logger.debug(f"Skipping {ticker} because shares={shares}")
@@ -369,12 +374,17 @@ def execute_buy_opportunities(opportunities: List[Dict[str, Any]]) -> None:
         
         if order_receipt or (not ENABLE_TRADING and os.getenv("STOCKS_DRY_RUN", "false").lower() == "true"):
             # Reconstruct the position dictionary for database insertion
+            entry_price = opp.get("entry_price") or (
+                (opp.get("entry_price_low", 0) + opp.get("entry_price_high", 0)) / 2 
+                if opp.get("entry_price_low") and opp.get("entry_price_high") else 0
+            )
+
             position = {
                 "ticker": ticker,
-                "entry_price": opp.get("current_price"),
-                "shares": shares,
-                "stop_loss": opp.get("suggested_stop"),
-                "target_price": opp.get("suggested_target"),
+                "entry_price": entry_price,
+                "shares": int(shares),
+                "stop_loss": opp.get("stop_loss"),
+                "target_price": opp.get("target_price"),
                 "entry_date": date.today().isoformat(),
                 "status": "open",
             }
