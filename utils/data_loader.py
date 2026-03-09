@@ -8,7 +8,7 @@ All public functions return ``None`` on failure.
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -33,7 +33,7 @@ def _get_cached(key: str) -> Optional[Any]:
     entry = _cache.get(key)
     if entry is None:
         return None
-    if datetime.utcnow() > entry["expires"]:
+    if datetime.now(timezone.utc) > entry["expires"]:
         del _cache[key]
         return None
     return entry["value"]
@@ -42,7 +42,7 @@ def _get_cached(key: str) -> Optional[Any]:
 def _set_cached(key: str, value: Any, ttl: int = CACHE_TTL_SECONDS) -> None:
     _cache[key] = {
         "value": value,
-        "expires": datetime.utcnow() + timedelta(seconds=ttl),
+        "expires": datetime.now(timezone.utc) + timedelta(seconds=ttl),
     }
 
 
@@ -146,7 +146,7 @@ def fetch_sp500_list() -> Optional[List[Dict[str, str]]]:
         return None
 
     # Clean tickers (e.g. BRK.B → BRK-B for yfinance)
-    df["ticker"] = df["ticker"].apply(lambda x: str(x).replace(".", "-"))
+    df.loc[:, "ticker"] = df["ticker"].astype(str).str.replace(".", "-")
 
     result = df[["ticker", "company_name", "sector", "industry"]].to_dict(
         orient="records"
@@ -216,7 +216,8 @@ def fetch_price_data(
             if bars is not None and not bars.empty:
                 df = bars.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
                 keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-                df = df[keep_cols].dropna(subset=["Close"])
+                # Drop rows where any of the critical OHLCV columns contain NaNs to prevent corruption in downstream TA methods 
+                df = df[keep_cols].dropna(subset=keep_cols)
                 if not df.empty:
                     _set_cached(cache_key, df)
                     logger.debug(f"Fetched price data for {ticker} via Alpaca: {len(df)} bars")
@@ -232,7 +233,7 @@ def fetch_price_data(
             logger.warning(f"yfinance: no data for {ticker}")
             return None
         keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-        df = df[keep_cols].dropna(subset=["Close"])
+        df = df[keep_cols].dropna(subset=keep_cols)
         if df.empty:
             return None
         _set_cached(cache_key, df)
@@ -277,7 +278,8 @@ def fetch_batch_prices(
                             if ticker in bars.index.get_level_values("symbol"):
                                 df = bars.xs(ticker, level="symbol").copy()
                                 df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
-                                result[ticker] = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+                                keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                                result[ticker] = df[keep_cols].dropna(subset=keep_cols)
                         except Exception as e:
                             logger.warning(f"Failed to extract {ticker} from Alpaca batch: {e}")
                 if result:
@@ -313,7 +315,7 @@ def fetch_batch_prices(
                 if df is None or df.empty:
                     continue
                 keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-                df = df[keep].dropna(subset=["Close"])
+                df = df[keep].dropna(subset=keep)
                 if not df.empty:
                     result[ticker] = df
             except Exception as e:

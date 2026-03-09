@@ -120,8 +120,8 @@ def insert_daily_scores(scores: List[Dict[str, Any]]) -> bool:
         chunk_size = 100
         for i in range(0, len(rows), chunk_size):
             chunk = rows[i : i + chunk_size]
-            _table("daily_scores").insert(chunk).execute()
-        logger.info(f"Inserted {len(rows)} daily scores")
+            _table("daily_scores").upsert(chunk, on_conflict="ticker, score_date").execute()
+        logger.info(f"Upserted {len(rows)} daily scores")
         return True
     except Exception as e:
         logger.error(f"insert_daily_scores failed: {e}", exc_info=True)
@@ -334,6 +334,26 @@ def get_trade_history(limit: int = 50) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# stocks.gpt_briefings
+# ---------------------------------------------------------------------------
+
+def insert_gpt_briefing(content: str, market_mood: str) -> bool:
+    """Insert a GPT-generated weekly briefing."""
+    try:
+        row = {
+            "content": content,
+            "market_mood": market_mood,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        _table("gpt_briefings").insert(row).execute()
+        logger.info("Inserted GPT briefing into database")
+        return True
+    except Exception as e:
+        logger.error(f"insert_gpt_briefing failed: {e}", exc_info=True)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # stocks.market_events
 # ---------------------------------------------------------------------------
 
@@ -393,9 +413,9 @@ def insert_equity_snapshot(snapshot: Dict[str, Any]) -> bool:
             "daily_pnl": snapshot.get("daily_pnl"),
             "total_pnl": snapshot.get("unrealized_pnl") or snapshot.get("total_pnl"),
         }
-        _table("equity_snapshots").insert(row).execute()
+        _table("equity_snapshots").upsert(row, on_conflict="snapshot_date").execute()
         logger.info(
-            f"Inserted equity snapshot: "
+            f"Upserted equity snapshot: "
             f"portfolio_value={row.get('portfolio_value')}"
         )
         return True

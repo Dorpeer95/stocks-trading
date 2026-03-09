@@ -29,6 +29,7 @@ from utils.position_sizing import (
     DEFAULT_MAX_POSITION_PCT,
     DEFAULT_MAX_TOTAL_RISK,
 )
+from utils.alpaca_broker import execute_trade
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ RISK_PER_TRADE = float(os.getenv("STOCKS_RISK_PER_TRADE", "0.02"))
 MAX_POSITIONS = int(os.getenv("STOCKS_MAX_POSITIONS", "8"))
 TRAILING_STOP_ATR_MULT = float(os.getenv("STOCKS_TRAILING_ATR_MULT", "2.0"))
 MAX_HOLD_DAYS = int(os.getenv("STOCKS_MAX_HOLD_DAYS", "42"))  # 6 weeks
+ENABLE_TRADING = os.getenv("STOCKS_ENABLE_TRADING", "false").lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +114,10 @@ def update_positions_intraday() -> List[Dict[str, Any]]:
                     "current_price": current,
                     "pnl": round(pnl, 2),
                     "pnl_pct": round(pnl_pct, 1),
-                    "urgency": "high",
+                    "urgent": "high",
                 }
+                if ENABLE_TRADING:
+                    execute_trade(ticker, "sell", shares, "market")
                 updates["status"] = "stopped_out"
                 updates["exit_price"] = current
                 updates["exit_date"] = date.today().isoformat()
@@ -127,8 +131,10 @@ def update_positions_intraday() -> List[Dict[str, Any]]:
                     "current_price": current,
                     "pnl": round(pnl, 2),
                     "pnl_pct": round(pnl_pct, 1),
-                    "urgency": "high",
+                    "urgent": "high",
                 }
+                if ENABLE_TRADING:
+                    execute_trade(ticker, "sell", shares, "market")
                 updates["status"] = "trailed_out"
                 updates["exit_price"] = current
                 updates["exit_date"] = date.today().isoformat()
@@ -142,8 +148,10 @@ def update_positions_intraday() -> List[Dict[str, Any]]:
                     "current_price": current,
                     "pnl": round(pnl, 2),
                     "pnl_pct": round(pnl_pct, 1),
-                    "urgency": "medium",
+                    "urgent": "medium",
                 }
+                if ENABLE_TRADING:
+                    execute_trade(ticker, "sell", shares, "market")
                 updates["status"] = "target_hit"
                 updates["exit_price"] = current
                 updates["exit_date"] = date.today().isoformat()
@@ -334,6 +342,47 @@ def can_open_position(position_value: float) -> Tuple[bool, str]:
         return False, "Would exceed total portfolio risk limit"
 
     return True, "OK"
+
+
+def execute_buy_opportunities(opportunities: List[Dict[str, Any]]) -> None:
+    """Attempt to autonomously open positions for top opportunities using Alpaca."""
+    for opp in opportunities:
+        position_value = opp.get("suggested_position_size", 0)
+        shares = opp.get("suggested_shares", 0)
+        ticker = opp.get("ticker")
+        
+        if not ticker or shares <= 0:
+            continue
+            
+        allowed, reason = can_open_position(position_value)
+        if not allowed:
+            logger.info(f"Skipping auto-buy for {ticker}: {reason}")
+            continue
+            
+        # Execute trade
+        order_receipt = None
+        if ENABLE_TRADING:
+             order_receipt = execute_trade(ticker, "buy", shares, "market")
+        
+        if order_receipt or (not ENABLE_TRADING and os.getenv("STOCKS_DRY_RUN", "false").lower() == "true"):
+            # Reconstruct the position dictionary for database insertion
+            position = {
+                "ticker": ticker,
+                "entry_price": opp.get("current_price"),
+                "shares": shares,
+                "stop_loss": opp.get("suggested_stop"),
+                "target_price": opp.get("suggested_target"),
+                "entry_date": date.today().isoformat(),
+                "status": "open",
+                "days_held": 0,
+                "trailing_stop": opp.get("suggested_stop"),
+                "atr_value": opp.get("atr"),
+            }
+            insert_position(position)
+            logger.info(f"Successfully processed position for {ticker} ({shares} shares) | Trading enabled: {ENABLE_TRADING}")
+        else:
+            logger.error(f"Failed to submit or skip Alpaca buy order for {ticker}")
+
 
 
 # ---------------------------------------------------------------------------

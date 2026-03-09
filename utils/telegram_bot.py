@@ -10,9 +10,6 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-import telegram
-from telegram import Bot
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -43,15 +40,14 @@ EMOJI = {
 }
 
 # ---------------------------------------------------------------------------
-# Bot singleton
+# Bot singleton (Using standard HTTP)
 # ---------------------------------------------------------------------------
 
-_bot: Optional[Bot] = None
 _chat_id: Optional[str] = None
+_token: Optional[str] = None
 
-
-def init_bot() -> Bot:
-    """Initialise and return the Telegram bot (singleton).
+def init_bot() -> None:
+    """Initialise and validate the Telegram credentials.
 
     Reads ``STOCKS_TELEGRAM_TOKEN`` and ``STOCKS_TELEGRAM_CHAT_ID``
     from the environment.
@@ -61,7 +57,7 @@ def init_bot() -> Bot:
     ValueError
         If required environment variables are missing.
     """
-    global _bot, _chat_id
+    global _token, _chat_id
 
     token = os.getenv("STOCKS_TELEGRAM_TOKEN")
     chat_id = os.getenv("STOCKS_TELEGRAM_CHAT_ID")
@@ -71,16 +67,9 @@ def init_bot() -> Bot:
             "STOCKS_TELEGRAM_TOKEN and STOCKS_TELEGRAM_CHAT_ID must be set"
         )
 
-    _bot = Bot(token=token)
+    _token = token
     _chat_id = chat_id
-    logger.info("Telegram bot initialised")
-    return _bot
-
-
-def _get_bot() -> Bot:
-    if _bot is None:
-        return init_bot()
-    return _bot
+    logger.info("Telegram configuration validated")
 
 
 def _get_chat_id() -> str:
@@ -121,48 +110,8 @@ def _split_message(text: str) -> List[str]:
     return chunks
 
 
-async def _send_async(text: str, parse_mode: Optional[str] = None) -> bool:
-    """Send a message with retry logic (async)."""
-    bot = _get_bot()
-    chat_id = _get_chat_id()
-    chunks = _split_message(text)
-
-    for i, chunk in enumerate(chunks):
-        # Add part indicator for multi-part messages
-        if len(chunks) > 1:
-            chunk = f"({i + 1}/{len(chunks)})\n{chunk}"
-
-        for attempt in range(1, 4):  # 3 retries
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=chunk,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=True,
-                )
-                break
-            except telegram.error.RetryAfter as e:
-                logger.warning(
-                    f"Telegram rate limited, waiting {e.retry_after}s"
-                )
-                await asyncio.sleep(e.retry_after)
-            except Exception as e:
-                if attempt < 3:
-                    logger.warning(
-                        f"Telegram send attempt {attempt}/3 failed: {e}"
-                    )
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    logger.error(
-                        f"Telegram send failed after 3 attempts: {e}"
-                    )
-                    return False
-
-    return True
-
-
 def send_message(text: str, parse_mode: Optional[str] = None) -> bool:
-    """Send a Telegram message (sync wrapper).
+    """Send a Telegram message (synchronous HTTP dispatch).
 
     Parameters
     ----------
@@ -173,17 +122,61 @@ def send_message(text: str, parse_mode: Optional[str] = None) -> bool:
     -------
     ``True`` on success, ``False`` on failure.
     """
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # We're inside an async context; create a task
-            future = asyncio.ensure_future(_send_async(text, parse_mode))
-            return True  # fire-and-forget in async context
-        else:
-            return loop.run_until_complete(_send_async(text, parse_mode))
-    except RuntimeError:
-        # No event loop — create a new one
-        return asyncio.run(_send_async(text, parse_mode))
+    import httpx
+    import time
+    
+    token = os.getenv("STOCKS_TELEGRAM_TOKEN")
+    chat_id = os.getenv("STOCKS_TELEGRAM_CHAT_ID")
+    
+    if not token or not chat_id:
+        logger.warning("Telegram token or chat ID missing.")
+        return False
+
+    chunks = _split_message(text)
+
+    for i, chunk in enumerate(chunks):
+        if len(chunks) > 1:
+            chunk = f"({i + 1}/{len(chunks)})\n{chunk}"
+
+        payload = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "disable_web_page_preview": True
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+
+        for attempt in range(1, 4):  # 3 retries
+            try:
+                resp = httpx.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json=payload,
+                    timeout=10.0
+                )
+                
+                if resp.status_code == 200:
+                    break
+                elif resp.status_code == 429:
+                    retry_after = int(resp.json().get("parameters", {}).get("retry_after", 3))
+                    logger.warning(f"Telegram rate limited, waiting {retry_after}s")
+                    time.sleep(retry_after)
+                else:
+                    if attempt < 3:
+                        logger.warning(f"Telegram send attempt {attempt}/3 failed: {resp.text}")
+                        time.sleep(2 ** attempt)
+                    else:
+                        logger.error(f"Telegram send failed after 3 attempts: {resp.text}")
+                        return False
+
+            except Exception as e:
+                if attempt < 3:
+                    logger.warning(f"Telegram send attempt {attempt}/3 failed: {e}")
+                    time.sleep(2 ** attempt)
+                else:
+                    logger.error(f"Telegram send failed after 3 attempts: {e}")
+                    return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -467,3 +460,48 @@ def format_action_needed(data: Dict[str, Any]) -> str:
         lines.append(f"Bot recommendation: {recommendation}")
 
     return "\n".join(lines)
+
+
+def start_command_listener() -> None:
+    """Start a background polling loop for Telegram commands."""
+    token = os.getenv("STOCKS_TELEGRAM_TOKEN")
+    if not token:
+        logger.warning("No STOCKS_TELEGRAM_TOKEN, skipping command listener.")
+        return
+
+    import asyncio
+    import threading
+    from telegram.ext import Application, CommandHandler
+    
+    def _run_polling():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        app = Application.builder().token(token).build()
+        
+        async def cmd_performance(update, context):
+            from agent.portfolio import get_portfolio_summary
+            summary = get_portfolio_summary()
+            
+            pnl = summary.get("total_unrealized_pnl", 0)
+            sign = "+" if pnl >= 0 else ""
+            emoji = EMOJI["bullish"] if pnl >= 0 else EMOJI["bearish"]
+            
+            lines = [
+                f"{EMOJI['chart']} PERFORMANCE SUMMARY",
+                f"Portfolio Value: ${summary.get('portfolio_value', 0):,.2f}",
+                f"Invested: ${summary.get('total_invested', 0):,.2f}",
+                f"Cash: ${summary.get('cash_available', 0):,.2f}",
+                f"Unrealized P&L: {emoji} {sign}${pnl:,.2f}",
+                f"Open Positions: {summary.get('open_positions', 0)}",
+                f"Win Rate: {summary.get('win_rate', 0)}%",
+            ]
+            await update.message.reply_text("\n".join(lines))
+
+        app.add_handler(CommandHandler("performance", cmd_performance))
+        
+        logger.info("Starting Telegram command listener (/performance)")
+        app.run_polling(drop_pending_updates=True)
+
+    t = threading.Thread(target=_run_polling, daemon=True, name="telegram-listener")
+    t.start()

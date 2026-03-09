@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from utils.earnings import earnings_risk_flag, fetch_earnings_history, calc_beat_streak
 from utils.insider import get_insider_signal
+from agent.macro_events import get_macro_bias, apply_macro_bias
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +334,7 @@ def score_candidate(
     skip_api_calls: bool = False,
     ml_predictions: Optional[Dict[str, Any]] = None,
     sentiment_data: Optional[Dict[str, Any]] = None,
+    macro_bias: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Compute the composite confidence score for a candidate.
 
@@ -370,6 +372,15 @@ def score_candidate(
         earnings = score_earnings_risk(ticker)
 
     macro = score_macro(regime)
+    
+    # Apply GPT macro bias to specific sectors
+    sector = stock.get("sector")
+    if not sector and fundamentals:
+        sector = fundamentals.get("sector")
+    
+    if sector and macro_bias:
+        macro = apply_macro_bias(macro, sector, macro_bias)
+
     ml = score_ml(ml_predictions) if ENABLE_ML else 50.0
 
     # Sentiment: use real news sentiment if available, else earnings-based proxy
@@ -478,6 +489,8 @@ def score_candidates(
     Only candidates above ``MIN_CONFIDENCE`` are included.
     """
     scored: List[Dict[str, Any]] = []
+    
+    macro_bias = get_macro_bias() if fetch_extras else None
 
     for i, c in enumerate(candidates):
         ticker = c.get("ticker", "???")
@@ -508,6 +521,7 @@ def score_candidates(
             skip_api_calls=not fetch_extras,
             ml_predictions=ml_preds,
             sentiment_data=sent_data,
+            macro_bias=macro_bias,
         )
         scored.append(scored_candidate)
 

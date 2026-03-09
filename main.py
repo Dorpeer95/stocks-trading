@@ -5,6 +5,7 @@ Initialises all components, starts the scheduler and health server,
 and handles graceful shutdown.
 """
 
+import argparse
 import logging
 import logging.handlers
 import os
@@ -110,6 +111,9 @@ def startup() -> None:
         init_ok["telegram"] = True
         logger.info("✅ Telegram bot connected")
         send_alert("bot_start", {})
+        
+        from utils.telegram_bot import start_command_listener
+        start_command_listener()
     except Exception as e:
         logger.error(f"❌ Telegram init failed (alerts will be logged): {e}")
 
@@ -135,6 +139,8 @@ def startup() -> None:
     scheduler.schedule_model_check(agent.model_check)
     scheduler.start()
     logger.info("✅ Scheduler started")
+    
+    return True
 
     # Update status for health endpoint
     next_runs = scheduler.get_next_run_times()
@@ -168,12 +174,26 @@ def shutdown() -> None:
 
 def main() -> None:
     """Entry point."""
+    parser = argparse.ArgumentParser(description="stocks-agent main entry point")
+    parser.add_argument("--force-scan", action="store_true", help="Force run the weekly scan immediately and exit")
+    args = parser.parse_args()
+
     # Register signal handlers
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
 
     try:
         startup()
+        
+        if args.force_scan:
+            logger.info("🚀 --force-scan flag detected. Running scan immediately...")
+            if agent is not None:
+                agent.weekly_scan()
+                logger.info("✅ Force scan completed.")
+            else:
+                logger.error("Agent failed to initialize. Cannot run force scan.")
+            shutdown()
+            sys.exit(0)
 
         # Keep main thread alive until shutdown signal
         logger.info("Main thread waiting for shutdown signal...")

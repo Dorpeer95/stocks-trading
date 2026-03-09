@@ -27,6 +27,7 @@ from agent.persistence import (
     insert_daily_scores,
     insert_opportunities,
     purge_old_scores,
+    insert_gpt_briefing,
 )
 from agent.portfolio import (
     PORTFOLIO_VALUE,
@@ -181,10 +182,14 @@ class AgentLoop:
                 )
                 opportunities.append(opp)
 
-            # 7. Persist
+            # 7. Persist & Execute
             if opportunities and not DRY_RUN:
                 insert_opportunities(opportunities)
                 logger.info(f"Persisted {len(opportunities)} opportunities")
+                
+                # logger.info("Triggering autonomous Alpaca buy execution for new opportunities...")
+                # from agent.portfolio import execute_buy_opportunities
+                # execute_buy_opportunities(opportunities)
 
             # 8. Persist daily scores (all scanned stocks)
             daily_scores = _build_daily_scores(
@@ -211,6 +216,11 @@ class AgentLoop:
                             f"GPT weekly briefing generated "
                             f"({len(gpt_briefing)} chars)"
                         )
+                        if not DRY_RUN:
+                            insert_gpt_briefing(
+                                gpt_briefing, 
+                                regime.get("mood", "Neutral") if regime else "Neutral"
+                            )
                 except Exception as e:
                     logger.warning(f"GPT weekly briefing failed: {e}")
 
@@ -419,17 +429,13 @@ def _build_daily_scores(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         scores.append({
             "ticker": ticker,
             "score_date": today,
-            "total_score": s.get("confidence", 0),
+            "confidence": s.get("confidence", 0),
             "technical_score": s.get("sub_scores", {}).get("technical"),
             "rs_score": s.get("sub_scores", {}).get("relative_strength"),
             "fundamental_score": s.get("sub_scores", {}).get("fundamental"),
             "sentiment_score": s.get("sub_scores", {}).get("sentiment"),
-            "rsi_14": s.get("rsi_14"),
-            "adx": s.get("adx"),
-            "macd_signal": s.get("macd_signal"),
-            "atr_pct": s.get("atr_pct"),
-            "rs_percentile": s.get("rs_percentile"),
-            "volume_ratio": s.get("volume_ratio"),
+            "sub_scores": s.get("sub_scores", {}),
+            "setup_type": s.get("setup_type"),
         })
 
     return scores
