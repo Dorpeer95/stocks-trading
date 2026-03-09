@@ -187,9 +187,9 @@ class AgentLoop:
                 insert_opportunities(opportunities)
                 logger.info(f"Persisted {len(opportunities)} opportunities")
                 
-                # logger.info("Triggering autonomous Alpaca buy execution for new opportunities...")
-                # from agent.portfolio import execute_buy_opportunities
-                # execute_buy_opportunities(opportunities)
+                logger.info("Triggering autonomous Alpaca buy execution for new opportunities...")
+                from agent.portfolio import execute_buy_opportunities
+                execute_buy_opportunities(opportunities)
 
             # 8. Persist daily scores (all scanned stocks)
             daily_scores = _build_daily_scores(

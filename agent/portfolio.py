@@ -352,7 +352,10 @@ def execute_buy_opportunities(opportunities: List[Dict[str, Any]]) -> None:
         ticker = opp.get("ticker")
         
         if not ticker or shares <= 0:
+            logger.debug(f"Skipping {ticker} because shares={shares}")
             continue
+            
+        logger.info(f"Attempting auto-buy for {ticker}: {shares} shares (${position_value:.2f})")
             
         allowed, reason = can_open_position(position_value)
         if not allowed:
@@ -374,9 +377,6 @@ def execute_buy_opportunities(opportunities: List[Dict[str, Any]]) -> None:
                 "target_price": opp.get("suggested_target"),
                 "entry_date": date.today().isoformat(),
                 "status": "open",
-                "days_held": 0,
-                "trailing_stop": opp.get("suggested_stop"),
-                "atr_value": opp.get("atr"),
             }
             insert_position(position)
             logger.info(f"Successfully processed position for {ticker} ({shares} shares) | Trading enabled: {ENABLE_TRADING}")
