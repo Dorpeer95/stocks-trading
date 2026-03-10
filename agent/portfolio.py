@@ -276,17 +276,17 @@ def get_portfolio_summary() -> Dict[str, Any]:
     risk_pct = total_risk / PORTFOLIO_VALUE if PORTFOLIO_VALUE > 0 else 0
 
     # Win rate from history
-    wins = [t for t in trade_history if t.get("realized_pnl", 0) > 0]
-    losses = [t for t in trade_history if t.get("realized_pnl", 0) <= 0]
+    wins = [t for t in trade_history if (t.get("pnl") or t.get("realized_pnl") or 0) > 0]
+    losses = [t for t in trade_history if (t.get("pnl") or t.get("realized_pnl") or 0) <= 0]
     total_trades = len(wins) + len(losses)
     win_rate = len(wins) / total_trades if total_trades > 0 else 0
 
     avg_win = (
-        sum(t["realized_pnl"] for t in wins) / len(wins)
+        sum(t.get("pnl") or t.get("realized_pnl") or 0 for t in wins) / len(wins)
         if wins else 0
     )
     avg_loss = (
-        abs(sum(t["realized_pnl"] for t in losses) / len(losses))
+        abs(sum(t.get("pnl") or t.get("realized_pnl") or 0 for t in losses) / len(losses))
         if losses else 0
     )
 

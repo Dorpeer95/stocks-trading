@@ -36,3 +36,4 @@ models/
 
 # Jupyter
 .ipynb_checkpoints/
+.vercel

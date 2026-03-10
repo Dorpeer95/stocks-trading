@@ -169,12 +169,12 @@ def insert_opportunities(opps: List[Dict[str, Any]]) -> bool:
 
 
 def get_pending_opportunities() -> List[Dict[str, Any]]:
-    """Get opportunities with status ``pending``."""
+    """Get opportunities with acted_on=False."""
     try:
         result = (
             _table("opportunities")
             .select("*")
-            .eq("status", "pending")
+            .eq("acted_on", False)
             .order("confidence", desc=True)
             .execute()
         )
@@ -231,18 +231,27 @@ def insert_position(position: Dict[str, Any]) -> bool:
 
 
 def update_position(position_id: str, updates: Dict[str, Any]) -> bool:
-    """Update a position by ID.
-
-    Common updates: ``current_price``, ``unrealized_pnl``,
-    ``trailing_stop``, ``status``, ``exit_price``.
-    """
+    """Update a position by ID with dynamic column filtering on failure."""
     try:
         updates["updated_at"] = datetime.utcnow().isoformat()
-        _table("positions").update(updates).eq("id", position_id).execute()
-        logger.debug(f"Updated position {position_id}")
+        try:
+            _table("positions").update(updates).eq("id", position_id).execute()
+        except Exception as e:
+            if "column" in str(e) or "filter" in str(e) or "PGRST204" in str(e):
+                logger.warning(f"Schema mismatch for position {position_id}. Attempting filtered update.")
+                # Fetch one row to see available columns
+                sample = _table("positions").select("*").limit(1).execute()
+                if sample.data:
+                    cols = set(sample.data[0].keys())
+                    filtered = {k: v for k, v in updates.items() if k in cols}
+                    _table("positions").update(filtered).eq("id", position_id).execute()
+                else:
+                    raise e
+            else:
+                raise e
         return True
     except Exception as e:
-        logger.error(f"update_position failed: {e}", exc_info=True)
+        logger.error(f"update_position failed: {e}")
         return False
 
 
