@@ -137,6 +137,7 @@ def startup() -> None:
     scheduler.schedule_intraday_monitor(agent.intraday_monitor)
     scheduler.schedule_after_market(agent.after_market_review)
     scheduler.schedule_model_check(agent.model_check)
+    scheduler.schedule_daily_health_check(agent.daily_health_check)
     scheduler.start()
     logger.info("✅ Scheduler started")
     
@@ -204,6 +205,15 @@ def main() -> None:
         logger.info("KeyboardInterrupt received")
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
+        try:
+            from utils.telegram_bot import send_alert
+            send_alert("action_needed", {
+                "ticker": "SYSTEM",
+                "reason": f"🛑 FATAL BOT CRASH: {str(e)}",
+                "recommendation": "Check server logs for traceback."
+            })
+        except Exception:
+            pass
     finally:
         shutdown()
         sys.exit(0)

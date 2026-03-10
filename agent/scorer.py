@@ -202,8 +202,15 @@ def score_insider(ticker: str) -> float:
         base = 50.0
         adj = signal.get("score_adjustment", 0)
 
-        # Scale adjustment: ±10 from insider maps to ±20 in score
-        return max(0, min(100, base + adj * 2))
+        # The utils.insider logic now passes back massive adjustments (+40) for clusters.
+        # Add the adjustment directly to the base.
+        final_score = base + adj
+        
+        # If it's a massive cluster buy, log it!
+        if signal.get("has_cluster_buy"):
+            logger.info(f"🚨 INSIDER CLUSTER BUY DETECTED FOR {ticker} 🚨")
+            
+        return max(0, min(100, final_score))
     except Exception as e:
         logger.debug(f"Insider scoring skipped for {ticker}: {e}")
         return 50.0  # neutral if unavailable

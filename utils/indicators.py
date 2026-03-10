@@ -383,6 +383,69 @@ def calc_atr_pct(df: pd.DataFrame, period: int = 14) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
+# Volatility Contraction Pattern (VCP) Detection
+# ---------------------------------------------------------------------------
+
+def detect_vcp(df: pd.DataFrame, lookback: int = 40) -> Optional[Dict[str, Any]]:
+    """Detect Volatility Contraction Pattern (VCP).
+    
+    A textbook VCP involves:
+    1. An established uptrend (price > 50 SMA > 200 SMA).
+    2. A series of price contractions (pullbacks get smaller).
+    3. Volume drying up on the contractions.
+    
+    Returns a dict with 'is_vcp' (bool) and diagnostic data, or None.
+    """
+    if not _validate_ohlcv(df, min_rows=200):
+        return None
+        
+    try:
+        # 1. Uptrend Check
+        sma_50 = df[CLOSE].rolling(50).mean()
+        sma_200 = df[CLOSE].rolling(200).mean()
+        current_close = df[CLOSE].iloc[-1]
+        
+        if current_close < sma_50.iloc[-1] or sma_50.iloc[-1] < sma_200.iloc[-1]:
+            return {"is_vcp": False, "reason": "Not in uptrend"}
+            
+        # 2. Contraction Math
+        # Look at the most recent N days and find local highs/lows
+        recent = df.iloc[-lookback:]
+        
+        # Super simplified VCP detection logic:
+        # Compare volatility from the first half of the lookback vs the second half
+        half = lookback // 2
+        first_half = recent.iloc[:half]
+        second_half = recent.iloc[half:]
+        
+        volatility_1 = (first_half[HIGH].max() - first_half[LOW].min()) / first_half[LOW].min()
+        volatility_2 = (second_half[HIGH].max() - second_half[LOW].min()) / second_half[LOW].min()
+        
+        # Volatility must be contracting (shrinking)
+        if volatility_2 >= volatility_1:
+            return {"is_vcp": False, "reason": "Volatility expanding"}
+            
+        # 3. Volume Check
+        # Volume should be drying up in the right side of the base
+        vol_1 = first_half[VOLUME].mean()
+        vol_2 = second_half[VOLUME].mean()
+        
+        if vol_2 >= vol_1 * 1.1: # Allow a tiny bit of variance, but generally lower
+            return {"is_vcp": False, "reason": "Volume expanding"}
+            
+        # If it passed all hurdles, it's a VCP!
+        return {
+            "is_vcp": True,
+            "contraction_1_pct": round(volatility_1 * 100, 2),
+            "contraction_2_pct": round(volatility_2 * 100, 2),
+            "reason": "VCP Detected"
+        }
+        
+    except Exception as e:
+        logger.error(f"detect_vcp failed: {e}")
+        return None
+
+# ---------------------------------------------------------------------------
 # Composite: compute everything in one pass
 # ---------------------------------------------------------------------------
 
@@ -434,6 +497,16 @@ def calc_all_indicators(df: pd.DataFrame) -> Optional[Dict[str, Union[float, str
             "obv_latest": round(float(obv.iloc[-1]), 0) if obv is not None else None,
             "vwap_latest": round(float(vwap.iloc[-1]), 2) if vwap is not None else None,
         }
+        
+        # Add VCP 
+        vcp = detect_vcp(df)
+        if vcp and vcp.get("is_vcp"):
+            result["vcp_detected"] = True
+            result["vcp_contraction"] = vcp.get("contraction_2_pct")
+        else:
+            result["vcp_detected"] = False
+            result["vcp_contraction"] = None
+            
         return result
 
     except Exception as e:

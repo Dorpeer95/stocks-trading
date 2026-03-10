@@ -106,46 +106,6 @@ def upsert_universe(stocks: List[Dict[str, Any]]) -> bool:
 # stocks.daily_scores
 # ---------------------------------------------------------------------------
 
-def insert_daily_scores(scores: List[Dict[str, Any]]) -> bool:
-    """Batch-insert daily scores for all scanned stocks.
-
-    Translates bot field names to actual Supabase column names.
-    """
-    if not scores:
-        logger.warning("insert_daily_scores: empty list")
-        return False
-    try:
-        rows = [_map_daily_score(s) for s in scores]
-        # Batch in chunks of 100 to avoid payload size limits
-        chunk_size = 100
-        for i in range(0, len(rows), chunk_size):
-            chunk = rows[i : i + chunk_size]
-            _table("daily_scores").upsert(chunk, on_conflict="ticker, score_date").execute()
-        logger.info(f"Upserted {len(rows)} daily scores")
-        return True
-    except Exception as e:
-        logger.error(f"insert_daily_scores failed: {e}", exc_info=True)
-        return False
-
-
-def _map_daily_score(s: Dict[str, Any]) -> Dict[str, Any]:
-    """Map bot daily-score fields → Supabase column names."""
-    sub = s.get("sub_scores", {})
-    return {
-        "ticker": s.get("ticker"),
-        "score_date": s.get("score_date"),
-        "confidence": s.get("confidence") or s.get("total_score"),
-        "technical_score": s.get("technical_score") or sub.get("technical"),
-        "rs_score": s.get("rs_score") or sub.get("relative_strength"),
-        "fundamental_score": s.get("fundamental_score") or sub.get("fundamental"),
-        "sentiment_score": s.get("sentiment_score") or sub.get("sentiment"),
-        "insider_score": sub.get("insider"),
-        "macro_score": sub.get("macro"),
-        "ml_score": sub.get("ml"),
-        "setup_type": s.get("setup_type"),
-    }
-
-
 # ---------------------------------------------------------------------------
 # stocks.opportunities
 # ---------------------------------------------------------------------------

@@ -20,24 +20,7 @@ CREATE TABLE IF NOT EXISTS stocks.universe (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Daily Scores
-CREATE TABLE IF NOT EXISTS stocks.daily_scores (
-    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    ticker VARCHAR(10) NOT NULL,
-    score_date DATE NOT NULL,
-    total_score NUMERIC(5,1),
-    technical_score NUMERIC(5,1),
-    rs_score NUMERIC(5,1),
-    fundamental_score NUMERIC(5,1),
-    sentiment_score NUMERIC(5,1),
-    rsi_14 NUMERIC(5,1),
-    adx NUMERIC(5,1),
-    macd_signal VARCHAR(10),
-    atr_pct NUMERIC(5,2),
-    rs_percentile NUMERIC(5,1),
-    volume_ratio NUMERIC(5,2),
-    UNIQUE(ticker, score_date)
-);
+
 
 -- Opportunities (weekly top picks)
 CREATE TABLE IF NOT EXISTS stocks.opportunities (

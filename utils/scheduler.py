@@ -211,6 +211,18 @@ class MarketScheduler:
         )
         logger.info("Scheduled: model_check — Mon-Fri 06:00 ET")
 
+    def schedule_daily_health_check(self, callback: Callable) -> None:
+        """Schedule the daily health check for 12:00 PM ET every day."""
+        self._scheduler.add_job(
+            self._wrap(callback, "daily_health_check"),
+            CronTrigger(hour=12, minute=0, timezone=ET),  # Runs 7 days a week
+            id="daily_health_check",
+            name="Daily health check",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        logger.info("Scheduled: daily_health_check — Daily 12:00 ET")
+
     # -- Lifecycle ------------------------------------------------------------
 
     def start(self) -> None:

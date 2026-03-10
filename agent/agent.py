@@ -24,9 +24,7 @@ from agent.persistence import (
     get_open_positions,
     get_pending_opportunities,
     get_recent_events,
-    insert_daily_scores,
     insert_opportunities,
-    purge_old_scores,
     insert_gpt_briefing,
 )
 from agent.portfolio import (
@@ -206,16 +204,6 @@ class AgentLoop:
                 logger.info("Triggering autonomous Alpaca buy execution for new opportunities...")
                 from agent.portfolio import execute_buy_opportunities
                 execute_buy_opportunities(opportunities)
-
-            # 8. Persist daily scores (all scanned stocks)
-            daily_scores = _build_daily_scores(
-                scan.get("candidates", []) + [
-                    c for c in scored if c not in scan.get("candidates", [])
-                ]
-            )
-            if daily_scores and not DRY_RUN:
-                insert_daily_scores(daily_scores)
-
             # 9. GPT-4o weekly briefing (Phase 4) — skip in emergency mode
             gpt_briefing: Optional[str] = None
             if ENABLE_GPT and opportunities and not emergency:
@@ -256,9 +244,8 @@ class AgentLoop:
             if not DRY_RUN:
                 take_equity_snapshot()
 
-            # 12. Purge old scores (monthly cleanup)
-            if date.today().day == 1:
-                purge_old_scores(days=180)
+            # 12. Monthly cleanup (Removed daily_scores purge)
+            pass
 
             elapsed = time.time() - start
             update_status("last_scan", time.strftime("%Y-%m-%dT%H:%M:%S"))
@@ -428,30 +415,35 @@ class AgentLoop:
             self._models_loaded = False
 
 
+    # ------------------------------------------------------------------
+    # 6. DAILY HEALTH CHECK (Daily 12:00 PM ET)
+    # ------------------------------------------------------------------
+    def daily_health_check(self) -> None:
+        """Send a daily heartbeat to Telegram so the user knows the bot is alive."""
+        logger.info("Daily health check — start")
+        try:
+            from health import check_memory
+            from utils.telegram_bot import send_message
+            
+            mem_info = check_memory()
+            mem_pct = mem_info.get("percent", 0.0)
+            
+            msg = f"🟢 Daily Health Check: Bot is running smoothly.\n"
+            msg += f"Memory Usage: {mem_pct:.1f}%\n"
+            msg += f"Open Positions: len({len(get_open_positions())})"
+            
+            send_message(msg)
+            
+            update_status(
+                "last_health_check",
+                time.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+            logger.info("Daily health check sent")
+            
+        except Exception as e:
+            logger.error(f"Daily health check failed: {e}", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
-
-def _build_daily_scores(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Build daily_scores records from scored stock data."""
-    today = date.today().isoformat()
-    scores: List[Dict[str, Any]] = []
-
-    for s in stocks:
-        ticker = s.get("ticker")
-        if not ticker:
-            continue
-
-        scores.append({
-            "ticker": ticker,
-            "score_date": today,
-            "confidence": s.get("confidence", 0),
-            "technical_score": s.get("sub_scores", {}).get("technical"),
-            "rs_score": s.get("sub_scores", {}).get("relative_strength"),
-            "fundamental_score": s.get("sub_scores", {}).get("fundamental"),
-            "sentiment_score": s.get("sub_scores", {}).get("sentiment"),
-            "sub_scores": s.get("sub_scores", {}),
-            "setup_type": s.get("setup_type"),
-        })
-
-    return scores

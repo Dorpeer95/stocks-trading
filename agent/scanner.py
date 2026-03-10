@@ -266,6 +266,15 @@ def apply_filters(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # Not overbought
         if rsi is not None and rsi > 80:
             continue
+            
+        # --- NEW: VCP Detection Enforcement ---
+        # The bot is now a specialized swing trader looking for Volatility Contraction
+        vcp_detected = s.get("vcp_detected", False)
+        if not vcp_detected:
+            # We ONLY want to pass charts that have formed a VCP base
+            continue
+            
+        reasons.append(f"VCP Setup ({s.get('vcp_contraction', 0)}% tight)")
 
         # Bullish signals (additive reasons)
         if ema_cross == "golden_cross":

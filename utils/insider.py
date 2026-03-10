@@ -157,16 +157,16 @@ def analyze_insider_activity(
     score_adj = 0
     if has_cluster:
         signal = "strong_bullish"
-        score_adj = 10
+        score_adj = 40  # Massive +80 total point swing when doubled in scorer.py
     elif has_officer_buy and buy_value > sell_value:
         signal = "bullish"
-        score_adj = 5
+        score_adj = 20
     elif len(buys) > len(sells) and net_value > 0:
         signal = "mild_bullish"
-        score_adj = 3
+        score_adj = 10
     elif len(sells) > len(buys) * 2 and sell_value > buy_value * 3:
         signal = "bearish"
-        score_adj = -5
+        score_adj = -20
     else:
         signal = "neutral"
         score_adj = 0
