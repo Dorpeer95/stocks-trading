@@ -346,6 +346,9 @@ def can_open_position(position_value: float) -> Tuple[bool, str]:
 
 def execute_buy_opportunities(opportunities: List[Dict[str, Any]]) -> None:
     """Attempt to autonomously open positions for top opportunities using Alpaca."""
+    open_positions = get_open_positions()
+    existing_tickers = {p.get("ticker") for p in open_positions if p.get("ticker")}
+
     for opp in opportunities:
         position_value = opp.get("position_size_usd", 0)
         shares = opp.get("shares", 0)
@@ -358,6 +361,10 @@ def execute_buy_opportunities(opportunities: List[Dict[str, Any]]) -> None:
         
         if not ticker or shares <= 0:
             logger.debug(f"Skipping {ticker} because shares={shares}")
+            continue
+            
+        if ticker in existing_tickers:
+            logger.info(f"Skipping auto-buy for {ticker}: Position already exists")
             continue
             
         logger.info(f"Attempting auto-buy for {ticker}: {shares} shares (${position_value:.2f})")
@@ -389,6 +396,7 @@ def execute_buy_opportunities(opportunities: List[Dict[str, Any]]) -> None:
                 "status": "open",
             }
             insert_position(position)
+            existing_tickers.add(ticker)
             logger.info(f"Successfully processed position for {ticker} ({shares} shares) | Trading enabled: {ENABLE_TRADING}")
         else:
             logger.error(f"Failed to submit or skip Alpaca buy order for {ticker}")

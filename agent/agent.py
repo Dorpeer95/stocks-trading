@@ -184,8 +184,24 @@ class AgentLoop:
 
             # 7. Persist & Execute
             if opportunities and not DRY_RUN:
-                insert_opportunities(opportunities)
-                logger.info(f"Persisted {len(opportunities)} opportunities")
+                # Deduplicate against today's already inserted opportunities
+                try:
+                    today_str = date.today().isoformat()
+                    from agent.persistence import _table
+                    existing = _table("opportunities").select("ticker").eq("scan_date", today_str).execute().data
+                    existing_tickers = {row["ticker"] for row in existing} if existing else set()
+                except Exception as e:
+                    logger.warning(f"Failed to fetch existing opportunities for deduplication: {e}")
+                    existing_tickers = set()
+
+                new_opps = [o for o in opportunities if o.get("ticker") not in existing_tickers]
+                
+                if new_opps:
+                    insert_opportunities(new_opps)
+                    logger.info(f"Persisted {len(new_opps)} new opportunities (skipped {len(opportunities) - len(new_opps)} duplicates)")
+                else:
+                    logger.info("No new opportunities to persist today.")
+
                 
                 logger.info("Triggering autonomous Alpaca buy execution for new opportunities...")
                 from agent.portfolio import execute_buy_opportunities
