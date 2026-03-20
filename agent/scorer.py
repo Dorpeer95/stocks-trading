@@ -51,8 +51,8 @@ else:
     W_MACRO = _W_MACRO_BASE
     W_ML = 0.0
 
-# Minimum confidence to become an opportunity
-MIN_CONFIDENCE = int(os.getenv("STOCKS_MIN_CONFIDENCE", "60"))
+# Minimum confidence to become an opportunity (was 60 — raising for quality)
+MIN_CONFIDENCE = int(os.getenv("STOCKS_MIN_CONFIDENCE", "65"))
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +122,23 @@ def score_technical(stock: Dict[str, Any]) -> float:
     # Near 52-week high (momentum play)
     if dist_high is not None:
         if -5 <= dist_high <= 0:
-            score += 5    # near high = strength
-        elif dist_high < -20:
-            score -= 5    # far from high
+            score += 10   # very near high = breakout candidate
+        elif -15 <= dist_high < -5:
+            score += 5    # within range
+        elif dist_high < -25:
+            score -= 10   # too far from high — not a leader
+
+    # VCP base quality: tighter = better signal
+    vcp_contraction = stock.get("vcp_contraction")
+    if vcp_contraction is not None:
+        if vcp_contraction < 6:
+            score += 20   # extremely tight — high-quality setup
+        elif vcp_contraction < 8:
+            score += 15   # very tight
+        elif vcp_contraction < 10:
+            score += 10   # solid
+        elif vcp_contraction < 12:
+            score += 5    # acceptable
 
     return max(0, min(100, score))
 
@@ -557,25 +571,54 @@ def build_opportunity(
 ) -> Dict[str, Any]:
     """Build an opportunity record ready for persistence.
 
-    Uses ATR for stop-loss and target calculation.
+    Entry logic (VCP-based swing trading):
+    - Entry trigger  = VCP pivot + 0.5% (buy when price BREAKS ABOVE the base high)
+    - Entry max      = pivot + 2%        (don't chase if already up > 2%)
+    - Stop loss      = base low - 1%     (structural stop below the consolidation)
+    - Target         = entry + 2.5 × risk (minimum 2.5:1 reward/risk)
+
+    This means the bot watches for a FUTURE breakout, not buying today's price.
     """
     ticker = stock.get("ticker", "???")
     close = stock.get("close", 0)
     atr_pct = stock.get("atr_pct", 2.0) or 2.0
     confidence = stock.get("confidence", 0)
 
-    # Stop loss: 1.5 × ATR below entry
-    atr_value = close * (atr_pct / 100)
-    stop_loss = round(close - (1.5 * atr_value), 2)
+    # ── Entry: use VCP pivot (structural breakout level) ────────────────────
+    vcp_pivot    = stock.get("vcp_pivot")
+    vcp_base_low = stock.get("vcp_base_low")
 
-    # Target: 3 × ATR above entry (2:1 risk/reward)
-    target = round(close + (3.0 * atr_value), 2)
+    if vcp_pivot and vcp_pivot > 0:
+        # Entry zone: breakout above the tight base high
+        # Buy when price breaks 0.5% above pivot, stop chasing past 2%
+        entry_low  = round(vcp_pivot * 1.005, 2)
+        entry_high = round(vcp_pivot * 1.020, 2)
+        entry_ref  = entry_low  # reference price for R/R math
 
-    # Entry zone: close ± 0.5% for limit order range
-    entry_low = round(close * 0.995, 2)
-    entry_high = round(close * 1.005, 2)
+        # Stop: below the base low with a small buffer
+        if vcp_base_low and vcp_base_low > 0:
+            stop_loss = round(vcp_base_low * 0.99, 2)
+        else:
+            # Fallback: 7% below entry (typical swing stop)
+            stop_loss = round(entry_ref * 0.93, 2)
+    else:
+        # Non-VCP fallback (should rarely hit since VCP is required by scanner)
+        atr_value  = close * (atr_pct / 100)
+        entry_low  = round(close * 0.995, 2)
+        entry_high = round(close * 1.005, 2)
+        entry_ref  = entry_low
+        stop_loss  = round(close - (2.0 * atr_value), 2)
 
-    # Position sizing (basic — portfolio.py does the real calculation)
+    # ── Target: minimum 2.5:1 risk/reward ───────────────────────────────────
+    risk_per_share = entry_ref - stop_loss
+    if risk_per_share <= 0:
+        # Degenerate case: stop is above entry — skip
+        risk_per_share = entry_ref * 0.07
+        stop_loss = round(entry_ref - risk_per_share, 2)
+
+    target = round(entry_ref + (risk_per_share * 2.5), 2)
+
+    # ── Position sizing ──────────────────────────────────────────────────────
     from utils.position_sizing import full_position_plan
 
     size_mod = 1.0
@@ -583,32 +626,38 @@ def build_opportunity(
         size_mod = regime.get("position_size_modifier", 1.0)
 
     risk_pct = 0.02 * size_mod
-    plan = full_position_plan(portfolio_value, close, stop_loss, target, risk_pct)
+    plan = full_position_plan(portfolio_value, entry_ref, stop_loss, target, risk_pct)
 
     position_value = plan.position_value if plan and plan.is_valid else 0
-    risk_usd = plan.risk_amount if plan and plan.is_valid else 0
-    reward_usd = plan.reward_amount if plan and plan.is_valid else 0
-    shares = plan.shares if plan and plan.is_valid else 0
-    rr_ratio = plan.risk_reward_ratio if plan and plan.is_valid else 0
+    risk_usd       = plan.risk_amount    if plan and plan.is_valid else 0
+    reward_usd     = plan.reward_amount  if plan and plan.is_valid else 0
+    shares         = plan.shares         if plan and plan.is_valid else 0
+    rr_ratio       = plan.risk_reward_ratio if plan and plan.is_valid else 0
 
+    # ── Reasons ──────────────────────────────────────────────────────────────
     reasons = stock.get("filter_reasons", [])
-    setup = stock.get("setup_type", "Mixed Signal")
+    vcp_tight = stock.get("vcp_contraction")
+    if vcp_tight:
+        reasons = [f"VCP {vcp_tight:.1f}% tight base"] + [r for r in reasons if "VCP" not in r]
+
+    setup = stock.get("setup_type", "VCP Breakout")
 
     return {
         "ticker": ticker,
-        "score_date": date.today().isoformat(),
+        "scan_date": date.today().isoformat(),
         "confidence": confidence,
         "setup_type": setup,
-        "entry_price_low": entry_low,
+        "entry_price_low":  entry_low,
         "entry_price_high": entry_high,
-        "stop_loss": stop_loss,
-        "target_price": target,
+        "stop_loss":        stop_loss,
+        "target_price":     target,
         "position_size_usd": round(position_value, 2),
-        "shares": shares,
-        "risk_usd": round(risk_usd, 2),
-        "reward_usd": round(reward_usd, 2),
+        "shares":            shares,
+        "risk_usd":          round(risk_usd, 2),
+        "reward_usd":        round(reward_usd, 2),
         "risk_reward_ratio": rr_ratio,
-        "reasons": reasons[:5],  # top 5 reasons
-        "sub_scores": stock.get("sub_scores", {}),
-        "status": "pending",
+        "reasons":           reasons[:5],
+        "sub_scores":        stock.get("sub_scores", {}),
+        "atr":               round(close * atr_pct / 100, 2),
+        "status":            "pending",
     }

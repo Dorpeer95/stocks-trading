@@ -386,61 +386,88 @@ def calc_atr_pct(df: pd.DataFrame, period: int = 14) -> Optional[float]:
 # Volatility Contraction Pattern (VCP) Detection
 # ---------------------------------------------------------------------------
 
-def detect_vcp(df: pd.DataFrame, lookback: int = 40) -> Optional[Dict[str, Any]]:
-    """Detect Volatility Contraction Pattern (VCP).
-    
-    A textbook VCP involves:
-    1. An established uptrend (price > 50 SMA > 200 SMA).
-    2. A series of price contractions (pullbacks get smaller).
-    3. Volume drying up on the contractions.
-    
-    Returns a dict with 'is_vcp' (bool) and diagnostic data, or None.
+def detect_vcp(df: pd.DataFrame, lookback: int = 60) -> Optional[Dict[str, Any]]:
+    """Detect a high-quality Volatility Contraction Pattern (VCP).
+
+    Requirements (Mark Minervini methodology):
+    1. Proper uptrend: price > SMA50 > SMA150 > SMA200
+    2. Within 25% of the 52-week high (only buy leaders)
+    3. Three-stage contracting pullbacks — each stage tighter than the last
+    4. Final stage (the current consolidation) must be < 12% range
+    5. Volume drying up into the tight base
+
+    Returns
+    -------
+    Dict with:
+    - ``is_vcp``            : bool
+    - ``pivot``             : exact breakout price to watch (high of tight base)
+    - ``base_low``          : stop reference (low of tight base)
+    - ``contraction_pct``   : tightness of the final base (%)  — lower is better
+    - ``base_depth_pct``    : depth of the full correction (%)
+    - ``reason``            : human-readable explanation
+    or ``None`` if input is invalid.
     """
-    if not _validate_ohlcv(df, min_rows=200):
+    if not _validate_ohlcv(df, min_rows=220):
         return None
-        
+
     try:
-        # 1. Uptrend Check
-        sma_50 = df[CLOSE].rolling(50).mean()
-        sma_200 = df[CLOSE].rolling(200).mean()
-        current_close = df[CLOSE].iloc[-1]
-        
-        if current_close < sma_50.iloc[-1] or sma_50.iloc[-1] < sma_200.iloc[-1]:
-            return {"is_vcp": False, "reason": "Not in uptrend"}
-            
-        # 2. Contraction Math
-        # Look at the most recent N days and find local highs/lows
+        close = df[CLOSE].iloc[-1]
+        sma50  = df[CLOSE].rolling(50).mean().iloc[-1]
+        sma150 = df[CLOSE].rolling(150).mean().iloc[-1]
+        sma200 = df[CLOSE].rolling(200).mean().iloc[-1]
+
+        # ── 1. Proper uptrend ────────────────────────────────────────────────
+        if not (close > sma50 > sma150 > sma200):
+            return {"is_vcp": False, "reason": "Not in uptrend (need price > SMA50 > SMA150 > SMA200)"}
+
+        # ── 2. Within 25% of 52-week high (leadership quality) ───────────────
+        high_52w = df[HIGH].iloc[-252:].max() if HIGH in df.columns else df[CLOSE].iloc[-252:].max()
+        dist_from_high_pct = (close - high_52w) / high_52w * 100  # negative
+        if dist_from_high_pct < -25:
+            return {"is_vcp": False, "reason": f"Too far from 52w high ({dist_from_high_pct:.1f}%)"}
+
+        # ── 3. Three-stage contraction ───────────────────────────────────────
         recent = df.iloc[-lookback:]
-        
-        # Super simplified VCP detection logic:
-        # Compare volatility from the first half of the lookback vs the second half
-        half = lookback // 2
-        first_half = recent.iloc[:half]
-        second_half = recent.iloc[half:]
-        
-        volatility_1 = (first_half[HIGH].max() - first_half[LOW].min()) / first_half[LOW].min()
-        volatility_2 = (second_half[HIGH].max() - second_half[LOW].min()) / second_half[LOW].min()
-        
-        # Volatility must be contracting (shrinking)
-        if volatility_2 >= volatility_1:
-            return {"is_vcp": False, "reason": "Volatility expanding"}
-            
-        # 3. Volume Check
-        # Volume should be drying up in the right side of the base
-        vol_1 = first_half[VOLUME].mean()
-        vol_2 = second_half[VOLUME].mean()
-        
-        if vol_2 >= vol_1 * 1.1: # Allow a tiny bit of variance, but generally lower
-            return {"is_vcp": False, "reason": "Volume expanding"}
-            
-        # If it passed all hurdles, it's a VCP!
+        seg = lookback // 3
+        s1 = recent.iloc[:seg]
+        s2 = recent.iloc[seg : seg * 2]
+        s3 = recent.iloc[seg * 2:]   # most recent = should be tightest
+
+        def _range_pct(seg: pd.DataFrame) -> float:
+            h = seg[HIGH].max() if HIGH in seg.columns else seg[CLOSE].max()
+            lo = seg[LOW].min() if LOW in seg.columns else seg[CLOSE].min()
+            return float((h - lo) / lo * 100) if lo > 0 else 999.0
+
+        r1, r2, r3 = _range_pct(s1), _range_pct(s2), _range_pct(s3)
+
+        if not (r1 > r2 > r3):
+            return {"is_vcp": False, "reason": f"Contractions not sequential ({r1:.1f}% → {r2:.1f}% → {r3:.1f}%)"}
+
+        # Final stage must be tight enough to be tradeable
+        if r3 > 12.0:
+            return {"is_vcp": False, "reason": f"Final base too loose ({r3:.1f}%, need < 12%)"}
+
+        # ── 4. Volume drying up in the base ──────────────────────────────────
+        vol1_avg = float(s1[VOLUME].mean()) if VOLUME in s1.columns else 1.0
+        vol3_avg = float(s3[VOLUME].mean()) if VOLUME in s3.columns else 0.0
+        if vol3_avg >= vol1_avg * 0.95:
+            return {"is_vcp": False, "reason": "Volume not drying up in base"}
+
+        # ── 5. Pivot and base-low ────────────────────────────────────────────
+        pivot    = float(s3[HIGH].max() if HIGH in s3.columns else s3[CLOSE].max())
+        base_low = float(s3[LOW].min()  if LOW  in s3.columns else s3[CLOSE].min())
+
+        base_depth = _range_pct(recent)
+
         return {
-            "is_vcp": True,
-            "contraction_1_pct": round(volatility_1 * 100, 2),
-            "contraction_2_pct": round(volatility_2 * 100, 2),
-            "reason": "VCP Detected"
+            "is_vcp":          True,
+            "pivot":           round(pivot, 2),
+            "base_low":        round(base_low, 2),
+            "contraction_pct": round(r3, 1),     # tightness of the current base
+            "base_depth_pct":  round(base_depth, 1),
+            "reason":          f"VCP — {r3:.1f}% tight base, pivot ${pivot:.2f}",
         }
-        
+
     except Exception as e:
         logger.error(f"detect_vcp failed: {e}")
         return None
@@ -498,15 +525,21 @@ def calc_all_indicators(df: pd.DataFrame) -> Optional[Dict[str, Union[float, str
             "vwap_latest": round(float(vwap.iloc[-1]), 2) if vwap is not None else None,
         }
         
-        # Add VCP 
+        # VCP — returns pivot price and base_low for entry/stop calculation
         vcp = detect_vcp(df)
         if vcp and vcp.get("is_vcp"):
-            result["vcp_detected"] = True
-            result["vcp_contraction"] = vcp.get("contraction_2_pct")
+            result["vcp_detected"]    = True
+            result["vcp_pivot"]       = vcp.get("pivot")        # breakout trigger level
+            result["vcp_base_low"]    = vcp.get("base_low")     # stop reference
+            result["vcp_contraction"] = vcp.get("contraction_pct")  # tightness %
+            result["vcp_base_depth"]  = vcp.get("base_depth_pct")
         else:
-            result["vcp_detected"] = False
+            result["vcp_detected"]    = False
+            result["vcp_pivot"]       = None
+            result["vcp_base_low"]    = None
             result["vcp_contraction"] = None
-            
+            result["vcp_base_depth"]  = None
+
         return result
 
     except Exception as e:

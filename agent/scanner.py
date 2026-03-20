@@ -30,11 +30,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Filter thresholds (can be overridden via env)
 # ---------------------------------------------------------------------------
-MIN_ADX = float(os.getenv("STOCKS_MIN_ADX", "20"))
-MIN_RS_PERCENTILE = float(os.getenv("STOCKS_MIN_RS_PERCENTILE", "50"))
-MAX_ATR_PCT = float(os.getenv("STOCKS_MAX_ATR_PCT", "8"))
+MIN_ADX = float(os.getenv("STOCKS_MIN_ADX", "25"))             # was 20 — need real trend
+MIN_RS_PERCENTILE = float(os.getenv("STOCKS_MIN_RS_PERCENTILE", "60"))  # was 50 — only leaders
+MAX_ATR_PCT = float(os.getenv("STOCKS_MAX_ATR_PCT", "7"))       # was 8 — tighter vol cap
 MIN_VOLUME_RATIO = float(os.getenv("STOCKS_MIN_VOLUME_RATIO", "0.5"))
-TOP_CANDIDATES_LIMIT = int(os.getenv("STOCKS_TOP_CANDIDATES", "30"))
+MAX_DIST_FROM_52W_HIGH = float(os.getenv("STOCKS_MAX_DIST_52W", "-25"))  # within 25% of high
+MAX_VCP_CONTRACTION = float(os.getenv("STOCKS_MAX_VCP_CONTRACTION", "12"))  # base can't be sloppy
+TOP_CANDIDATES_LIMIT = int(os.getenv("STOCKS_TOP_CANDIDATES", "20"))    # was 30 — fewer, better
 
 # ML filter settings
 ENABLE_ML_FILTER = os.getenv("STOCKS_ENABLE_ML_FILTER", "true").lower() == "true"
@@ -267,14 +269,24 @@ def apply_filters(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if rsi is not None and rsi > 80:
             continue
             
-        # --- NEW: VCP Detection Enforcement ---
-        # The bot is now a specialized swing trader looking for Volatility Contraction
+        # Within 25% of 52-week high: only buy leaders near highs, not bottoms
+        dist_high = s.get("distance_52w_high")
+        if dist_high is None or dist_high < MAX_DIST_FROM_52W_HIGH:
+            continue
+        reasons.append(f"Near 52w high ({dist_high:+.1f}%)")
+
+        # VCP required: must have a confirmed tight base
         vcp_detected = s.get("vcp_detected", False)
         if not vcp_detected:
-            # We ONLY want to pass charts that have formed a VCP base
             continue
-            
-        reasons.append(f"VCP Setup ({s.get('vcp_contraction', 0)}% tight)")
+
+        # VCP must be tight enough to be worth trading
+        vcp_contraction = s.get("vcp_contraction") or 99
+        if vcp_contraction > MAX_VCP_CONTRACTION:
+            continue
+
+        vcp_pivot = s.get("vcp_pivot")
+        reasons.append(f"VCP {vcp_contraction:.1f}% base — pivot ${vcp_pivot:.2f}" if vcp_pivot else f"VCP {vcp_contraction:.1f}% base")
 
         # Bullish signals (additive reasons)
         if ema_cross == "golden_cross":

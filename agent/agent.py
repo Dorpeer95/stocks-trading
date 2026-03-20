@@ -70,6 +70,7 @@ class AgentLoop:
         self._last_scan_result: Optional[Dict[str, Any]] = None
         self._last_regime: Optional[Dict[str, Any]] = None
         self._last_events: List[Dict[str, Any]] = []
+        self._entry_alert_cache: Dict[str, float] = {}  # ticker → last alert timestamp
 
         # ML model manager (Phase 3)
         self._model_manager = ModelManager()
@@ -272,7 +273,7 @@ class AgentLoop:
     # 2. MORNING BRIEFING (Mon-Fri 8:30 AM ET)
     # ------------------------------------------------------------------
     def morning_briefing(self) -> None:
-        """Pre-market briefing with positions and macro context."""
+        """Pre-market briefing with action plan: enter now / hold / watch."""
         logger.info("Morning briefing — start")
 
         try:
@@ -288,6 +289,7 @@ class AgentLoop:
 
             # Open positions
             positions = get_open_positions()
+            open_tickers = {p.get("ticker") for p in positions}
             pos_details = []
             for p in positions:
                 pos_details.append({
@@ -295,31 +297,83 @@ class AgentLoop:
                     "entry_price": p.get("entry_price"),
                     "current_price": p.get("current_price"),
                     "unrealized_pnl": p.get("unrealized_pnl", 0),
+                    "unrealized_pnl_pct": p.get("unrealized_pnl_pct", 0),
                     "stop_loss": p.get("stop_loss"),
                     "target_price": p.get("target_price"),
                     "days_held": p.get("days_held", 0),
                 })
 
-            # Event descriptions
-            event_texts = [e.get("description", "") for e in events]
+            # Watchlist: check pending opportunities against current prices
+            enter_now: list = []
+            watchlist: list = []
+            try:
+                pending = get_pending_opportunities()
+                for opp in pending[:8]:  # check top 8 by confidence
+                    ticker = opp.get("ticker")
+                    # entry_price may be null on old rows — fall back to low/high avg
+                    entry_price = float(opp.get("entry_price") or 0)
+                    if not entry_price:
+                        low = float(opp.get("entry_price_low") or 0)
+                        high = float(opp.get("entry_price_high") or 0)
+                        entry_price = round((low + high) / 2, 2) if (low or high) else 0
+                    if not ticker or not entry_price or ticker in open_tickers:
+                        continue
+                    try:
+                        from utils.data_loader import fetch_price_data
+                        df = fetch_price_data(ticker, period="5d", interval="1d")
+                        if df is None or df.empty:
+                            continue
+                        current = float(df["Close"].iloc[-1])
+                        # distance_pct: negative means below trigger (still waiting)
+                        distance_pct = (current - entry_price) / entry_price * 100
+                        item = {
+                            "ticker": ticker,
+                            "current_price": current,
+                            "entry_price": entry_price,
+                            "stop_loss": float(opp.get("stop_loss") or 0),
+                            "target_price": float(opp.get("target_price") or 0),
+                            "confidence": opp.get("confidence", 0),
+                            "distance_pct": distance_pct,
+                            "notes": opp.get("notes", ""),
+                        }
+                        # Within 2% below or any amount above entry = enter now
+                        if distance_pct >= -2.0:
+                            enter_now.append(item)
+                        else:
+                            watchlist.append(item)
+                    except Exception as e:
+                        logger.warning(f"Failed to check price for {ticker}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to load pending opportunities: {e}")
 
-            # Macro summary
-            macro_summary = {}
-            if macro:
-                for key, val in macro.items():
-                    macro_summary[key] = val.get("current", 0)
+            # Sort watchlist closest to entry first
+            watchlist.sort(key=lambda x: x.get("distance_pct", -999), reverse=True)
+
+            # Event descriptions
+            event_texts = [
+                {"severity": e.get("severity", "low"), "event_detail": e.get("description", "")}
+                for e in events
+            ]
+
+            # Macro summary (pass full dicts so formatter can read change_pct)
+            macro_summary = macro or {}
 
             send_alert("morning_briefing", {
                 "events": event_texts,
                 "positions": pos_details,
                 "macro": macro_summary,
+                "enter_now": enter_now,
+                "watchlist": watchlist,
             })
 
             update_status(
                 "last_morning_briefing",
                 time.strftime("%Y-%m-%dT%H:%M:%S"),
             )
-            logger.info("Morning briefing sent")
+            logger.info(
+                f"Morning briefing sent — {len(enter_now)} enter now, "
+                f"{len(watchlist)} watching"
+            )
 
         except Exception as e:
             logger.error(f"Morning briefing failed: {e}", exc_info=True)
@@ -328,10 +382,11 @@ class AgentLoop:
     # 3. INTRADAY MONITOR (every 15 min during market hours)
     # ------------------------------------------------------------------
     def intraday_monitor(self) -> None:
-        """Check open positions for exit signals."""
+        """Check open positions for exit signals and watchlist for entry triggers."""
         logger.debug("Intraday monitor tick")
 
         try:
+            # 1. Exit checks on open positions
             actions = update_positions_intraday()
 
             for action in actions:
@@ -342,6 +397,52 @@ class AgentLoop:
                         f"Action alert: {action['ticker']} — "
                         f"{action['action']}"
                     )
+
+            # 2. Entry trigger checks on watchlist
+            try:
+                open_tickers = {p.get("ticker") for p in get_open_positions()}
+                pending = get_pending_opportunities()
+
+                for opp in pending[:8]:
+                    ticker = opp.get("ticker")
+                    entry_price = float(opp.get("entry_price") or 0)
+                    if not entry_price:
+                        low = float(opp.get("entry_price_low") or 0)
+                        high = float(opp.get("entry_price_high") or 0)
+                        entry_price = round((low + high) / 2, 2) if (low or high) else 0
+                    if not ticker or not entry_price or ticker in open_tickers:
+                        continue
+
+                    # Skip if we already alerted this ticker recently
+                    alerted_key = f"entry_alerted_{ticker}"
+                    last_alert = self._entry_alert_cache.get(alerted_key, 0)
+                    if time.time() - last_alert < 3600:  # 1h cooldown
+                        continue
+
+                    try:
+                        from utils.data_loader import fetch_price_data
+                        df = fetch_price_data(ticker, period="1d", interval="5m")
+                        if df is None or df.empty:
+                            continue
+                        current = float(df["Close"].iloc[-1])
+
+                        if current >= entry_price:
+                            send_alert("entry_signal", {
+                                "ticker": ticker,
+                                "current_price": current,
+                                "entry_price": entry_price,
+                                "stop_loss": float(opp.get("stop_loss") or 0),
+                                "target_price": float(opp.get("target_price") or 0),
+                                "confidence": opp.get("confidence", 0),
+                                "notes": opp.get("notes", ""),
+                            })
+                            self._entry_alert_cache[alerted_key] = time.time()
+                            logger.info(f"Entry signal fired: {ticker} at ${current:.2f}")
+                    except Exception as e:
+                        logger.warning(f"Entry check failed for {ticker}: {e}")
+
+            except Exception as e:
+                logger.warning(f"Watchlist entry check failed: {e}")
 
         except Exception as e:
             logger.error(f"Intraday monitor failed: {e}", exc_info=True)

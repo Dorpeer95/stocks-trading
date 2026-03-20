@@ -132,22 +132,37 @@ def _map_opportunity(opp: Dict[str, Any]) -> Dict[str, Any]:
     """Map bot opportunity fields → Supabase column names."""
     reasons = opp.get("reasons", [])
     notes = "; ".join(reasons[:5]) if reasons else opp.get("notes", "")
-    # Average entry_price_low/high → single entry_price
+
     entry_low = opp.get("entry_price_low", 0) or 0
     entry_high = opp.get("entry_price_high", 0) or 0
     entry_price = opp.get("entry_price") or (
         round((entry_low + entry_high) / 2, 2) if entry_low and entry_high else entry_low
     )
+
+    scan_date = opp.get("scan_date") or opp.get("score_date")
+    rr = opp.get("risk_reward_ratio") or opp.get("risk_reward")
+    shares = opp.get("shares")
+    position_size_usd = opp.get("position_size_usd") or (
+        round(shares * entry_price, 2) if shares and entry_price else None
+    )
+
     return {
-        "ticker": opp.get("ticker"),
-        "scan_date": opp.get("scan_date") or opp.get("score_date"),
-        "confidence": opp.get("confidence"),
-        "setup_type": opp.get("setup_type"),
-        "entry_price": entry_price,
-        "stop_loss": opp.get("stop_loss"),
-        "target_price": opp.get("target_price"),
-        "risk_reward": opp.get("risk_reward_ratio") or opp.get("risk_reward"),
-        "position_size": opp.get("shares") or opp.get("position_size"),
+        "ticker":            opp.get("ticker"),
+        "scan_date":         scan_date,
+        "confidence":        opp.get("confidence"),
+        "setup_type":        opp.get("setup_type"),
+        "entry_price_low":   entry_low or None,
+        "entry_price_high":  entry_high or None,
+        "entry_price":       entry_price or None,
+        "stop_loss":         opp.get("stop_loss"),
+        "target_price":      opp.get("target_price"),
+        "risk_reward_ratio": rr,
+        "risk_reward":       rr,
+        "position_size_usd": position_size_usd,
+        "shares":            shares,
+        "risk_usd":          opp.get("risk_usd"),
+        "reward_usd":        opp.get("reward_usd"),
+        # New columns (added by migration_001)
         "atr": opp.get("atr"),
         "notes": notes,
         "acted_on": False,

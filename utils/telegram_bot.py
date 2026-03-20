@@ -211,9 +211,12 @@ def send_alert(alert_type: str, data: Dict[str, Any]) -> bool:
             d.get("events", []),
             d.get("positions", []),
             d.get("macro", {}),
+            enter_now=d.get("enter_now", []),
+            watchlist=d.get("watchlist", []),
         ),
         "eod_summary": lambda d: format_eod_summary(d),
         "action_needed": lambda d: format_action_needed(d),
+        "entry_signal": lambda d: format_entry_signal(d),
         "bot_start": lambda d: f"{EMOJI['bot_start']} Stocks bot started",
         "bot_stop": lambda d: f"{EMOJI['bot_stop']} Stocks bot stopped",
     }
@@ -296,11 +299,7 @@ def format_weekly_summary(
 ) -> str:
     """Format the weekly summary with top picks.
 
-    Parameters
-    ----------
-    gpt_briefing : Optional GPT-4o-generated natural language briefing.
-                   When present, it is included at the top of the message
-                   as a conversational market overview.
+    Top 3 are flagged as priority plays. Rest go on the watch list.
     """
     mood_emoji = {
         "Bullish": EMOJI["bullish"],
@@ -309,33 +308,47 @@ def format_weekly_summary(
     }.get(market_mood, EMOJI["neutral"])
 
     lines = [
-        f"{EMOJI['chart']} WEEKLY STOCK OPPORTUNITIES",
+        f"{EMOJI['chart']} WEEKLY SWING TRADING PLAYBOOK",
         f"",
-        f"Market mood: {market_mood} {mood_emoji}",
+        f"Market: {market_mood} {mood_emoji}",
     ]
 
     if hot_sectors:
-        lines.append(f"Hot sectors: {', '.join(hot_sectors)}")
+        lines.append(f"Hot sectors: {', '.join(hot_sectors[:3])}")
 
     lines.append("")
 
-    # GPT-4o analyst briefing (Phase 4)
     if gpt_briefing:
-        lines.append("━━━ AI Analyst Briefing ━━━")
+        lines.append("━━━ AI Briefing ━━━")
         lines.append(gpt_briefing.strip())
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append("")
 
     if not opportunities:
-        lines.append("No high-conviction setups this week.")
+        lines.append("No high-conviction setups this week. Stay in cash.")
     else:
-        lines.append("This week's top picks:")
+        priority = opportunities[:3]
+        watchlist = opportunities[3:]
+
+        lines.append("🎯 PRIORITY — enter if price hits trigger:")
         lines.append("")
-        for i, opp in enumerate(opportunities, 1):
-            lines.append(f"{i}. {format_opportunity(opp)}")
+        for opp in priority:
+            lines.append(format_opportunity(opp))
             lines.append("")
 
-    lines.append("Full details in dashboard 📱")
+        if watchlist:
+            lines.append("👀 WATCHING — not ready yet:")
+            for opp in watchlist:
+                ticker = opp.get("ticker", "???")
+                entry_low = opp.get("entry_price_low", 0)
+                entry_high = opp.get("entry_price_high", 0)
+                conf = opp.get("confidence", 0)
+                lines.append(
+                    f"  • {ticker}  trigger ${entry_low:.2f}–${entry_high:.2f}  ({conf}/100)"
+                )
+            lines.append("")
+
+    lines.append("Morning briefing will show exact entry signals each day.")
     return "\n".join(lines)
 
 
@@ -343,8 +356,17 @@ def format_morning_briefing(
     events: List[Dict[str, Any]],
     positions: List[Dict[str, Any]],
     macro: Optional[Dict[str, Any]] = None,
+    enter_now: Optional[List[Dict[str, Any]]] = None,
+    watchlist: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Format the daily morning briefing."""
+    """Format the daily morning briefing with a clear action plan.
+
+    Sections (in order):
+    1. TODAY'S ACTION PLAN — enter_now stocks at entry trigger
+    2. HOLD — open positions with P&L and levels
+    3. WATCHING — pending setups not yet at entry
+    4. Market indicators / macro events
+    """
     from datetime import date as dt_date
 
     lines = [
@@ -352,42 +374,85 @@ def format_morning_briefing(
         "",
     ]
 
-    # Macro summary
-    if macro:
-        lines.append("Market indicators:")
-        for name, data in macro.items():
-            if isinstance(data, dict):
-                change = data.get("change_pct", 0)
-                current = data.get("current", 0)
-                arrow = "↑" if change > 0 else "↓" if change < 0 else "→"
-                lines.append(
-                    f"  {name.upper()}: {current:.2f} {arrow} {change:+.2f}%"
-                )
+    # ── 1. ENTER NOW ──────────────────────────────────────────────────────────
+    if enter_now:
+        lines.append("🚀 ENTER NOW — price at trigger zone:")
+        lines.append("")
+        for item in enter_now:
+            ticker = item.get("ticker", "???")
+            current = item.get("current_price", 0)
+            entry = item.get("entry_price", 0)
+            stop = item.get("stop_loss", 0)
+            target = item.get("target_price", 0)
+            conf = item.get("confidence", 0)
+            dist = item.get("distance_pct", 0)
+            dist_str = f"{dist:+.1f}% from trigger" if dist else ""
+            lines.append(f"  ✅ {ticker}  now ${current:.2f}  {dist_str}")
+            lines.append(f"     Entry: ${entry:.2f}  Stop: ${stop:.2f}  Target: ${target:.2f}  ({conf}/100)")
+        lines.append("")
+    else:
+        lines.append("— No new entries today.")
         lines.append("")
 
-    # Events
+    # ── 2. OPEN POSITIONS (HOLD) ──────────────────────────────────────────────
+    if positions:
+        lines.append(f"{EMOJI['money']} HOLD — your open positions:")
+        lines.append("")
+        for pos in positions:
+            ticker = pos.get("ticker", "???")
+            current = pos.get("current_price", 0)
+            pnl = pos.get("unrealized_pnl", 0)
+            pnl_pct = pos.get("unrealized_pnl_pct", 0)
+            stop = pos.get("stop_loss", 0)
+            target = pos.get("target_price", 0)
+            days = pos.get("days_held", 0)
+            sign = "+" if pnl >= 0 else ""
+            emoji = EMOJI["bullish"] if pnl >= 0 else EMOJI["bearish"]
+            lines.append(
+                f"  {emoji} {ticker}  ${current:.2f}  {sign}${pnl:,.0f} ({sign}{pnl_pct:.1f}%)  Day {days}"
+            )
+            lines.append(f"     Stop: ${stop:.2f}  Target: ${target:.2f}")
+        lines.append("")
+
+    # ── 3. WATCHING ───────────────────────────────────────────────────────────
+    if watchlist:
+        lines.append("👀 WATCHING — waiting for price to hit trigger:")
+        for item in watchlist:
+            ticker = item.get("ticker", "???")
+            current = item.get("current_price", 0)
+            entry = item.get("entry_price", 0)
+            dist = item.get("distance_pct", 0)
+            conf = item.get("confidence", 0)
+            lines.append(
+                f"  • {ticker}  now ${current:.2f}  trigger ${entry:.2f}  ({dist:.1f}% away)  {conf}/100"
+            )
+        lines.append("")
+
+    # ── 4. MACRO / EVENTS ────────────────────────────────────────────────────
     if events:
-        lines.append(f"{EMOJI['warning']} Events detected:")
+        lines.append(f"{EMOJI['warning']} Market events:")
         for ev in events:
-            severity = ev.get("severity", "low")
-            detail = ev.get("event_detail", ev.get("event_type", ""))
-            sev_emoji = {
-                "critical": "🔴",
-                "high": "🟠",
-                "medium": "🟡",
-                "low": "🔵",
-            }.get(severity, "⚪")
+            if isinstance(ev, dict):
+                severity = ev.get("severity", "low")
+                detail = ev.get("event_detail", ev.get("event_type", str(ev)))
+            else:
+                severity = "low"
+                detail = str(ev)
+            sev_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}.get(severity, "⚪")
             lines.append(f"  {sev_emoji} {detail}")
         lines.append("")
 
-    # Open positions
-    if positions:
-        lines.append(f"{EMOJI['money']} Open positions:")
-        for pos in positions:
-            lines.append(f"  {format_position_update(pos)}")
-        lines.append("")
-    else:
-        lines.append("No open positions.\n")
+    if macro:
+        spy = macro.get("spy", {})
+        vix = macro.get("vix", {})
+        if spy or vix:
+            parts = []
+            if isinstance(spy, dict):
+                parts.append(f"SPY {spy.get('current', 0):.0f} ({spy.get('change_pct', 0):+.1f}%)")
+            if isinstance(vix, dict):
+                parts.append(f"VIX {vix.get('current', 0):.1f}")
+            if parts:
+                lines.append("  " + "  |  ".join(parts))
 
     return "\n".join(lines)
 
@@ -458,6 +523,36 @@ def format_action_needed(data: Dict[str, Any]) -> str:
 
     if recommendation:
         lines.append(f"Bot recommendation: {recommendation}")
+
+    return "\n".join(lines)
+
+
+def format_entry_signal(data: Dict[str, Any]) -> str:
+    """Format an intraday entry trigger alert — sent when a watchlist stock hits its entry price."""
+    ticker = data.get("ticker", "???")
+    current = data.get("current_price", 0)
+    entry = data.get("entry_price", 0)
+    stop = data.get("stop_loss", 0)
+    target = data.get("target_price", 0)
+    conf = data.get("confidence", 0)
+    risk = abs(current - stop) if stop else 0
+    reward = abs(target - current) if target else 0
+    rr = round(reward / risk, 1) if risk > 0 else 0
+
+    lines = [
+        f"🚀 ENTRY SIGNAL — {ticker}",
+        "",
+        f"Price ${current:.2f} hit trigger ${entry:.2f}",
+        "",
+        f"  BUY {ticker} at market now",
+        f"  {EMOJI['stop']} Stop loss: ${stop:.2f}  (risk ${risk:.2f}/share)",
+        f"  {EMOJI['target']} Target:    ${target:.2f}  (reward ${reward:.2f}/share)",
+        f"  Risk/Reward: 1:{rr}  |  Confidence: {conf}/100",
+    ]
+
+    notes = data.get("notes", "")
+    if notes:
+        lines.append(f"  Why: {notes}")
 
     return "\n".join(lines)
 
