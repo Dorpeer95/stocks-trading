@@ -68,7 +68,10 @@ def update_positions_intraday() -> List[Dict[str, Any]]:
     for pos in positions:
         ticker = pos.get("ticker", "???")
         try:
-            df = fetch_price_data(ticker, period="5d", interval="1d")
+            df = fetch_price_data(ticker, period="1d", interval="5m")
+            if df is None or df.empty:
+                # Fallback to daily if intraday unavailable (pre/post market)
+                df = fetch_price_data(ticker, period="5d", interval="1d")
             if df is None or df.empty:
                 logger.warning(f"No price data for position {ticker}")
                 continue

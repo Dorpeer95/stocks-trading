@@ -26,6 +26,8 @@ from agent.persistence import (
     get_recent_events,
     insert_opportunities,
     insert_gpt_briefing,
+    insert_signal_history,
+    get_consecutive_strong_weeks,
 )
 from agent.portfolio import (
     PORTFOLIO_VALUE,
@@ -35,8 +37,9 @@ from agent.portfolio import (
     take_equity_snapshot,
     update_positions_intraday,
 )
+from agent.portfolio_manager import run_portfolio_cycle, ENTRY_THRESHOLD
 from agent.scanner import scan_universe, filter_by_ml_direction
-from agent.scorer import build_opportunity, score_candidates, ENABLE_ML
+from agent.scorer import build_opportunity, score_candidates, ENABLE_ML, MIN_CONFIDENCE
 from health import update_status, get_status, check_memory
 from utils.data_loader import fetch_macro_data, clear_cache
 from utils.sentiment import (
@@ -161,7 +164,15 @@ class AgentLoop:
                 except Exception as e:
                     logger.warning(f"Batch sentiment failed: {e}")
 
-            # 5. Score candidates (with fundamentals/insider + ML + sentiment)
+            # 5. Build signal_age_map from signal history (for scoring bonus)
+            today_str = date.today().isoformat()
+            signal_age_map: Dict[str, int] = {}
+            for c in candidates:
+                t = c.get("ticker")
+                if t:
+                    signal_age_map[t] = get_consecutive_strong_weeks(t, MIN_CONFIDENCE)
+
+            # 6. Score candidates (with fundamentals/insider + ML + sentiment + signal age)
             fetch_extras = ENABLE_INSIDER or ENABLE_EARNINGS
             scored = score_candidates(
                 candidates,
@@ -169,45 +180,66 @@ class AgentLoop:
                 fetch_extras=fetch_extras,
                 ml_predictions_map=ml_predictions_map if ENABLE_ML else None,
                 sentiment_map=sentiment_map if ENABLE_SENTIMENT else None,
+                signal_age_map=signal_age_map,
             )
 
-            # 6. Build opportunities
+            # 7. Persist signal history for ALL scored candidates this week
+            if not DRY_RUN:
+                try:
+                    sig_records = [
+                        {
+                            "ticker": s["ticker"],
+                            "scan_date": today_str,
+                            "confidence": s.get("confidence", 0),
+                            "sub_scores": s.get("sub_scores", {}),
+                            "in_portfolio": False,   # updated by portfolio_manager
+                            "setup_type": s.get("setup_type", ""),
+                            "passed_scan": True,
+                        }
+                        for s in scored if s.get("ticker")
+                    ]
+                    if sig_records:
+                        insert_signal_history(sig_records)
+                except Exception as e:
+                    logger.warning(f"signal_history insert failed: {e}")
+
+            # 8. Run portfolio state machine — the core managed-portfolio logic
+            portfolio_diff: Dict[str, Any] = {}
+            try:
+                portfolio_diff = run_portfolio_cycle(scored, scan_date=today_str)
+            except Exception as e:
+                logger.error(f"portfolio_cycle failed: {e}", exc_info=True)
+
+            # 9. Build opportunities from portfolio new_entries + active holdings
+            #    (for Alpaca execution and legacy persistence)
             opportunities: List[Dict[str, Any]] = []
-            for stock in scored[:10]:  # top 10
-                opp = build_opportunity(
-                    stock,
-                    portfolio_value=PORTFOLIO_VALUE,
-                    regime=regime,
-                )
+            entry_tickers = {c["ticker"] for c in portfolio_diff.get("new_entries", [])}
+            scored_map = {s["ticker"]: s for s in scored if s.get("ticker")}
+            for stock in portfolio_diff.get("new_entries", []):
+                opp = build_opportunity(stock, portfolio_value=PORTFOLIO_VALUE, regime=regime)
                 opportunities.append(opp)
 
-            # 7. Persist & Execute
             if opportunities and not DRY_RUN:
-                # Deduplicate against today's already inserted opportunities
                 try:
-                    today_str = date.today().isoformat()
                     from agent.persistence import _table
                     existing = _table("opportunities").select("ticker").eq("scan_date", today_str).execute().data
                     existing_tickers = {row["ticker"] for row in existing} if existing else set()
                 except Exception as e:
-                    logger.warning(f"Failed to fetch existing opportunities for deduplication: {e}")
+                    logger.warning(f"Dedup check failed: {e}")
                     existing_tickers = set()
 
                 new_opps = [o for o in opportunities if o.get("ticker") not in existing_tickers]
-                
                 if new_opps:
                     insert_opportunities(new_opps)
-                    logger.info(f"Persisted {len(new_opps)} new opportunities (skipped {len(opportunities) - len(new_opps)} duplicates)")
-                else:
-                    logger.info("No new opportunities to persist today.")
+                    logger.info(f"Persisted {len(new_opps)} new opportunities")
 
-                
-                logger.info("Triggering autonomous Alpaca buy execution for new opportunities...")
+                logger.info("Triggering Alpaca buy execution for new portfolio entries...")
                 from agent.portfolio import execute_buy_opportunities
                 execute_buy_opportunities(opportunities)
-            # 9. GPT-4o weekly briefing (Phase 4) — skip in emergency mode
+
+            # 10. GPT-4o weekly briefing
             gpt_briefing: Optional[str] = None
-            if ENABLE_GPT and opportunities and not emergency:
+            if ENABLE_GPT and not emergency:
                 try:
                     gpt_briefing = gpt4o_weekly_briefing({
                         "opportunities": opportunities,
@@ -215,31 +247,28 @@ class AgentLoop:
                         "hot_sectors": scan.get("hot_sectors", []),
                         "regime": regime,
                         "events": self._last_events,
+                        "portfolio_diff": portfolio_diff,
                     })
-                    if gpt_briefing:
-                        logger.info(
-                            f"GPT weekly briefing generated "
-                            f"({len(gpt_briefing)} chars)"
+                    if gpt_briefing and not DRY_RUN:
+                        insert_gpt_briefing(
+                            gpt_briefing,
+                            regime.get("mood", "Neutral") if regime else "Neutral",
                         )
-                        if not DRY_RUN:
-                            insert_gpt_briefing(
-                                gpt_briefing, 
-                                regime.get("mood", "Neutral") if regime else "Neutral"
-                            )
                 except Exception as e:
                     logger.warning(f"GPT weekly briefing failed: {e}")
 
-            # 10. Send Telegram alert
+            # 11. Send portfolio update alert (new format)
             mood = regime.get("mood", "Neutral") if regime else "Neutral"
             alert_data: Dict[str, Any] = {
-                "opportunities": opportunities,
+                "portfolio_diff": portfolio_diff,
                 "market_mood": mood,
                 "hot_sectors": scan.get("hot_sectors", []),
+                "regime": regime,
             }
             if gpt_briefing:
                 alert_data["gpt_briefing"] = gpt_briefing
 
-            send_alert("weekly_summary", alert_data)
+            send_alert("portfolio_update", alert_data)
 
             # 11. Take equity snapshot
             if not DRY_RUN:

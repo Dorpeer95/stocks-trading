@@ -201,6 +201,14 @@ def send_alert(alert_type: str, data: Dict[str, Any]) -> bool:
     formatters = {
         "opportunity": lambda d: format_opportunity(d),
         "position_update": lambda d: format_position_update(d),
+        "portfolio_update": lambda d: format_portfolio_update(
+            d.get("portfolio_diff", {}),
+            d.get("market_mood", "Neutral"),
+            d.get("hot_sectors", []),
+            d.get("regime"),
+            gpt_briefing=d.get("gpt_briefing"),
+        ),
+        # legacy — kept for backward compat
         "weekly_summary": lambda d: format_weekly_summary(
             d.get("opportunities", []),
             d.get("market_mood", "Neutral"),
@@ -217,8 +225,8 @@ def send_alert(alert_type: str, data: Dict[str, Any]) -> bool:
         "eod_summary": lambda d: format_eod_summary(d),
         "action_needed": lambda d: format_action_needed(d),
         "entry_signal": lambda d: format_entry_signal(d),
-        "bot_start": lambda d: f"{EMOJI['bot_start']} Stocks bot started",
-        "bot_stop": lambda d: f"{EMOJI['bot_stop']} Stocks bot stopped",
+        "bot_start": lambda d: format_bot_start(d),
+        "bot_stop": lambda d: f"{EMOJI['bot_stop']} Bot stopped.",
     }
 
     formatter = formatters.get(alert_type)
@@ -287,6 +295,148 @@ def format_position_update(pos: Dict[str, Any]) -> str:
         f"  {EMOJI['target']} Target: ${target:.2f}",
         f"  {EMOJI['stop']} Stop: ${stop:.2f}",
     ]
+
+    return "\n".join(lines)
+
+
+def format_portfolio_update(
+    diff: Dict[str, Any],
+    market_mood: str = "Neutral",
+    hot_sectors: Optional[List[str]] = None,
+    regime: Optional[Dict[str, Any]] = None,
+    gpt_briefing: Optional[str] = None,
+) -> str:
+    """Format the weekly portfolio state-machine update.
+
+    Replaces the old 'fresh picks' weekly summary with a clear
+    HOLD / WATCH / BUY / SELL / SWAP diff view.
+    """
+    from datetime import date as dt_date
+
+    mood_emoji = {"Bullish": "🟢", "Bearish": "🔴", "Neutral": "🟡"}.get(
+        market_mood, "🟡"
+    )
+    vix_str = ""
+    if regime:
+        vix = regime.get("vix", {})
+        if isinstance(vix, dict) and vix.get("current"):
+            vix_str = f"  |  VIX {vix['current']:.1f}"
+
+    lines = [
+        f"📊 PORTFOLIO — {dt_date.today().strftime('%b %d, %Y')}",
+        f"Market: {market_mood} {mood_emoji}{vix_str}",
+        "",
+    ]
+
+    if hot_sectors:
+        lines.append(f"Leading sectors: {', '.join(hot_sectors[:3])}")
+        lines.append("")
+
+    if gpt_briefing:
+        lines.append("━━━ AI Briefing ━━━")
+        lines.append(gpt_briefing.strip())
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+
+    holdings = diff.get("holdings", [])
+    new_entries = diff.get("new_entries", [])
+    exits = diff.get("exits", [])
+    watch_cleared = diff.get("watch_cleared", [])
+    displacements = diff.get("displacements", [])
+    open_slots = diff.get("open_slots", 0)
+
+    entry_tickers = {c.get("ticker") for c in new_entries}
+
+    # ── HOLDING STRONG ────────────────────────────────────────────────────
+    strong_holds = [
+        h for h in holdings
+        if h["status"] == "active" and h["ticker"] not in entry_tickers
+    ]
+    if strong_holds:
+        lines.append(f"✅ HOLDING STRONG ({len(strong_holds)})")
+        for h in strong_holds:
+            ticker = h["ticker"]
+            conf = h.get("current_confidence") or 0
+            prev = h.get("prev_confidence") or conf
+            weeks = h.get("weeks_held") or 0
+            arrow = "↑" if conf >= prev else "→"
+            conf_delta = f"{conf:.0f}{arrow}"
+            lines.append(f"  {ticker:<6} conf {conf_delta}  wk{weeks}")
+        lines.append("")
+
+    # ── WATCH — WEAKENING ─────────────────────────────────────────────────
+    watch_holds = [h for h in holdings if h["status"] == "watch"]
+    if watch_holds:
+        lines.append("⚠️ WATCH — signal weakening")
+        for h in watch_holds:
+            ticker = h["ticker"]
+            conf = h.get("current_confidence") or 0
+            prev = h.get("prev_confidence") or conf
+            weak_weeks = h.get("consecutive_weak_weeks") or 1
+            lines.append(
+                f"  {ticker:<6} conf {conf:.0f}↓ was {prev:.0f}  "
+                f"({weak_weeks}/2 weak weeks)"
+            )
+        lines.append("")
+
+    # ── WATCH CLEARED ─────────────────────────────────────────────────────
+    if watch_cleared:
+        lines.append("💪 SIGNAL RECOVERED")
+        for ticker in watch_cleared:
+            lines.append(f"  {ticker} — back to active")
+        lines.append("")
+
+    # ── NEW ENTRIES ───────────────────────────────────────────────────────
+    if new_entries:
+        lines.append(f"🟢 NEW ENTRY — add to portfolio")
+        for c in new_entries:
+            ticker = c.get("ticker", "???")
+            conf = c.get("confidence", 0)
+            entry_low = c.get("entry_price_low", 0)
+            entry_high = c.get("entry_price_high", 0)
+            stop = c.get("stop_loss", 0)
+            target = c.get("target_price", 0)
+            setup = c.get("setup_type", "")
+            lines.append(
+                f"  {ticker}  conf {conf:.0f}  |  "
+                f"entry ${entry_low:.2f}–${entry_high:.2f}  "
+                f"stop ${stop:.2f}  tgt ${target:.2f}"
+            )
+            if setup:
+                lines.append(f"    Setup: {setup}")
+        lines.append("")
+
+    # ── EXITS ─────────────────────────────────────────────────────────────
+    if exits:
+        lines.append("🔴 EXIT — sell these positions")
+        for ticker in exits:
+            # Find exit holding detail if still in diff
+            exiting = next(
+                (h for h in holdings if h["ticker"] == ticker), None
+            )
+            reason = exiting.get("notes", "Signal broken") if exiting else "Signal broken"
+            lines.append(f"  {ticker}  — {reason}")
+        lines.append("")
+
+    # ── DISPLACEMENT SUGGESTION ───────────────────────────────────────────
+    if displacements:
+        lines.append("🔄 CONSIDER SWAP (optional)")
+        for d in displacements:
+            lines.append(
+                f"  Sell {d['weak_ticker']} (conf {d['weak_conf']:.0f})  →  "
+                f"Buy {d['new_ticker']} (conf {d['new_conf']:.0f}, "
+                f"+{d['gap']:.0f} pts)"
+            )
+        lines.append("")
+
+    # ── PORTFOLIO SLOTS ───────────────────────────────────────────────────
+    total_active = len([h for h in holdings if h["status"] in ("active", "watch")])
+    max_slots = total_active + open_slots
+    lines.append(f"📭 Slots: {total_active}/{max_slots} filled")
+
+    if not strong_holds and not watch_holds and not new_entries:
+        lines.append("")
+        lines.append("No high-conviction setups this week. Stay patient.")
 
     return "\n".join(lines)
 
@@ -553,6 +703,35 @@ def format_entry_signal(data: Dict[str, Any]) -> str:
     notes = data.get("notes", "")
     if notes:
         lines.append(f"  Why: {notes}")
+
+    return "\n".join(lines)
+
+
+def format_bot_start(data: Dict[str, Any]) -> str:
+    """Format the startup/redeploy confirmation alert."""
+    from datetime import datetime as dt
+
+    env = data.get("env", "unknown")
+    dry_run = data.get("dry_run", False)
+    init_ok = data.get("init_ok", {})
+    next_scan = data.get("next_weekly_scan", "unknown")
+    next_briefing = data.get("next_morning_briefing", "unknown")
+
+    mode = "DRY RUN" if dry_run else "LIVE"
+    now = dt.now().strftime("%b %d %H:%M")
+
+    lines = [
+        f"🟢 Bot redeployed successfully — {now}",
+        f"Mode: {mode}  |  Env: {env}",
+        "",
+        "Components:",
+        f"  {'✅' if init_ok.get('supabase') else '❌'} Supabase",
+        f"  {'✅' if init_ok.get('telegram') else '❌'} Telegram",
+        "",
+        "Next scheduled:",
+        f"  📊 Weekly scan:      {next_scan}",
+        f"  ☀️  Morning briefing: {next_briefing}",
+    ]
 
     return "\n".join(lines)
 

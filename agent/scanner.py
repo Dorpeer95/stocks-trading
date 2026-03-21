@@ -30,13 +30,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Filter thresholds (can be overridden via env)
 # ---------------------------------------------------------------------------
-MIN_ADX = float(os.getenv("STOCKS_MIN_ADX", "25"))             # was 20 — need real trend
-MIN_RS_PERCENTILE = float(os.getenv("STOCKS_MIN_RS_PERCENTILE", "60"))  # was 50 — only leaders
-MAX_ATR_PCT = float(os.getenv("STOCKS_MAX_ATR_PCT", "7"))       # was 8 — tighter vol cap
+MIN_ADX = float(os.getenv("STOCKS_MIN_ADX", "28"))             # strong trend only
+MIN_RS_PERCENTILE = float(os.getenv("STOCKS_MIN_RS_PERCENTILE", "70"))  # top 30% vs SPY only
+MAX_ATR_PCT = float(os.getenv("STOCKS_MAX_ATR_PCT", "6"))       # tighter volatility cap
 MIN_VOLUME_RATIO = float(os.getenv("STOCKS_MIN_VOLUME_RATIO", "0.5"))
-MAX_DIST_FROM_52W_HIGH = float(os.getenv("STOCKS_MAX_DIST_52W", "-25"))  # within 25% of high
-MAX_VCP_CONTRACTION = float(os.getenv("STOCKS_MAX_VCP_CONTRACTION", "12"))  # base can't be sloppy
-TOP_CANDIDATES_LIMIT = int(os.getenv("STOCKS_TOP_CANDIDATES", "20"))    # was 30 — fewer, better
+MAX_DIST_FROM_52W_HIGH = float(os.getenv("STOCKS_MAX_DIST_52W", "-20"))  # within 20% of 52w high
+MAX_VCP_CONTRACTION = float(os.getenv("STOCKS_MAX_VCP_CONTRACTION", "10"))  # tight bases only
+TOP_CANDIDATES_LIMIT = int(os.getenv("STOCKS_TOP_CANDIDATES", "15"))    # fewer, higher quality
+SECTOR_LEADERSHIP_TOP_N = int(os.getenv("STOCKS_SECTOR_LEADERSHIP_N", "3"))  # must be in top N sectors
 
 # ML filter settings
 ENABLE_ML_FILTER = os.getenv("STOCKS_ENABLE_ML_FILTER", "true").lower() == "true"
@@ -185,9 +186,9 @@ def scan_universe() -> Dict[str, Any]:
     hot = get_hot_sectors(sector_rankings)
 
     # ------------------------------------------------------------------
-    # 5. Apply filters
+    # 5. Apply filters (pass hot_sectors for leadership check)
     # ------------------------------------------------------------------
-    candidates = apply_filters(stock_data)
+    candidates = apply_filters(stock_data, hot_sectors=hot)
     logger.info(
         f"Filters passed: {len(candidates)}/{len(stock_data)} stocks"
     )
@@ -216,16 +217,22 @@ def scan_universe() -> Dict[str, Any]:
 # Filters
 # ---------------------------------------------------------------------------
 
-def apply_filters(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def apply_filters(
+    stocks: List[Dict[str, Any]],
+    hot_sectors: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """Apply technical/fundamental filters to the scanned universe.
 
-    A stock passes if:
-    - ADX > MIN_ADX (trending)
-    - RS percentile > MIN_RS_PERCENTILE
-    - ATR% < MAX_ATR_PCT (not too volatile)
+    A stock passes ALL of:
+    - ADX > MIN_ADX (strong trend)
+    - RS percentile > MIN_RS_PERCENTILE (top 30% vs SPY)
+    - ATR% < MAX_ATR_PCT (controlled volatility)
     - Volume ratio > MIN_VOLUME_RATIO (liquid)
     - EMA cross is NOT death_cross
-    - RSI is not overbought (< 80)
+    - RSI < 75 (not overbought)
+    - Within MAX_DIST_FROM_52W_HIGH of 52w high (leaders only)
+    - VCP detected with contraction < MAX_VCP_CONTRACTION
+    - Sector is in top SECTOR_LEADERSHIP_TOP_N sectors (if hot_sectors provided)
     """
     passed: List[Dict[str, Any]] = []
 
@@ -243,52 +250,64 @@ def apply_filters(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if adx is None or atr_pct is None:
             continue
 
-        # Trending
+        # Strong trend required
         if adx < MIN_ADX:
             continue
         reasons.append(f"ADX={adx:.0f}")
 
-        # Relative strength
+        # Must be top 30% relative strength vs SPY
         if rs_pct < MIN_RS_PERCENTILE:
             continue
         reasons.append(f"RS={rs_pct:.0f}%ile")
 
-        # Volatility cap
+        # Volatility cap — no wild movers
         if atr_pct > MAX_ATR_PCT:
             continue
 
-        # Volume
+        # Minimum liquidity
         if vol_ratio is not None and vol_ratio < MIN_VOLUME_RATIO:
             continue
 
-        # Not in death cross
+        # Must not be in a downtrend
         if ema_cross == "death_cross":
             continue
 
-        # Not overbought
-        if rsi is not None and rsi > 80:
+        # Not overbought (tightened from 80 to 75)
+        if rsi is not None and rsi > 75:
             continue
-            
-        # Within 25% of 52-week high: only buy leaders near highs, not bottoms
+
+        # Leaders only — within 20% of 52w high
         dist_high = s.get("distance_52w_high")
         if dist_high is None or dist_high < MAX_DIST_FROM_52W_HIGH:
             continue
         reasons.append(f"Near 52w high ({dist_high:+.1f}%)")
 
-        # VCP required: must have a confirmed tight base
+        # VCP required — confirmed tight base
         vcp_detected = s.get("vcp_detected", False)
         if not vcp_detected:
             continue
 
-        # VCP must be tight enough to be worth trading
+        # Tight base only — no sloppy consolidations
         vcp_contraction = s.get("vcp_contraction") or 99
         if vcp_contraction > MAX_VCP_CONTRACTION:
             continue
 
         vcp_pivot = s.get("vcp_pivot")
-        reasons.append(f"VCP {vcp_contraction:.1f}% base — pivot ${vcp_pivot:.2f}" if vcp_pivot else f"VCP {vcp_contraction:.1f}% base")
+        reasons.append(
+            f"VCP {vcp_contraction:.1f}% — pivot ${vcp_pivot:.2f}"
+            if vcp_pivot else f"VCP {vcp_contraction:.1f}% base"
+        )
 
-        # Bullish signals (additive reasons)
+        # Sector leadership filter — must be in a leading sector
+        if hot_sectors and len(hot_sectors) >= SECTOR_LEADERSHIP_TOP_N:
+            stock_sector = s.get("sector", "")
+            top_sectors = hot_sectors[:SECTOR_LEADERSHIP_TOP_N]
+            if stock_sector and stock_sector not in top_sectors:
+                continue
+            if stock_sector in top_sectors:
+                reasons.append(f"Leading sector ({stock_sector})")
+
+        # Additive signal reasons
         if ema_cross == "golden_cross":
             reasons.append("Golden Cross")
         elif ema_cross == "bullish":

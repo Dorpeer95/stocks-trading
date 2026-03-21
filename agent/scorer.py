@@ -26,12 +26,14 @@ ENABLE_ML = os.getenv("STOCKS_ENABLE_ML", "true").lower() == "true"
 W_ML = float(os.getenv("STOCKS_W_ML", "0.15"))  # 15% when active
 
 # Base weights (sum = 1.0 when ML is off)
-_W_TECHNICAL_BASE = float(os.getenv("STOCKS_W_TECHNICAL", "0.35"))
-_W_RS_BASE = float(os.getenv("STOCKS_W_RS", "0.25"))
+# RS raised to 0.28 — sustained outperformance is the strongest signal.
+# Macro lowered to 0.02 — regime already gates position sizing.
+_W_TECHNICAL_BASE = float(os.getenv("STOCKS_W_TECHNICAL", "0.33"))
+_W_RS_BASE = float(os.getenv("STOCKS_W_RS", "0.28"))
 _W_FUNDAMENTAL_BASE = float(os.getenv("STOCKS_W_FUNDAMENTAL", "0.15"))
-_W_SENTIMENT_BASE = float(os.getenv("STOCKS_W_SENTIMENT", "0.10"))
-_W_INSIDER_BASE = float(os.getenv("STOCKS_W_INSIDER", "0.10"))
-_W_MACRO_BASE = float(os.getenv("STOCKS_W_MACRO", "0.05"))
+_W_SENTIMENT_BASE = float(os.getenv("STOCKS_W_SENTIMENT", "0.09"))
+_W_INSIDER_BASE = float(os.getenv("STOCKS_W_INSIDER", "0.09"))
+_W_MACRO_BASE = float(os.getenv("STOCKS_W_MACRO", "0.06"))
 
 if ENABLE_ML:
     # Scale traditional weights down so total = 1.0
@@ -51,8 +53,13 @@ else:
     W_MACRO = _W_MACRO_BASE
     W_ML = 0.0
 
-# Minimum confidence to become an opportunity (was 60 — raising for quality)
-MIN_CONFIDENCE = int(os.getenv("STOCKS_MIN_CONFIDENCE", "65"))
+# Minimum confidence to enter the managed portfolio
+# Raised from 65 → 72. High-conviction only.
+MIN_CONFIDENCE = int(os.getenv("STOCKS_MIN_CONFIDENCE", "72"))
+
+# Signal age bonus: reward stocks that have held strong signal for multiple weeks.
+# Fetched from signal_history during scoring when available.
+SIGNAL_AGE_BONUS_MAX = float(os.getenv("STOCKS_SIGNAL_AGE_BONUS", "5.0"))  # max +5 pts
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +363,7 @@ def score_candidate(
     ml_predictions: Optional[Dict[str, Any]] = None,
     sentiment_data: Optional[Dict[str, Any]] = None,
     macro_bias: Optional[Dict[str, Any]] = None,
+    signal_age_weeks: int = 0,
 ) -> Dict[str, Any]:
     """Compute the composite confidence score for a candidate.
 
@@ -411,7 +419,32 @@ def score_candidate(
         # Fallback: derive sentiment-like score from earnings safety
         sent = (earnings * 0.7 + 30)  # 0-100 range
 
-    # Composite (weighted sum)
+    # ── GPT risk flag veto ───────────────────────────────────────────────────
+    # If GPT detected a serious risk (SEC probe, guidance cut, major litigation)
+    # exclude the stock entirely regardless of technical score.
+    gpt_vetoed = False
+    if sentiment_data is not None:
+        risk_flags = sentiment_data.get("risk_flags", [])
+        serious_flags = [
+            f for f in risk_flags
+            if any(kw in f.lower() for kw in (
+                "sec", "investigation", "fraud", "lawsuit", "litigation",
+                "guidance cut", "guidance miss", "ceo resign", "cfo resign",
+                "bankruptcy", "delisting", "restatement",
+            ))
+        ]
+        if serious_flags:
+            logger.warning(
+                f"GPT veto: {ticker} has serious risk flags {serious_flags} — excluded"
+            )
+            stock["confidence"] = 0
+            stock["gpt_vetoed"] = True
+            stock["gpt_veto_reason"] = "; ".join(serious_flags)
+            stock["sub_scores"] = {}
+            stock["setup_type"] = "GPT_VETO"
+            return stock
+
+    # ── Composite (weighted sum) ─────────────────────────────────────────────
     confidence = (
         tech * W_TECHNICAL
         + rs * W_RS
@@ -422,12 +455,21 @@ def score_candidate(
         + ml * W_ML
     )
 
+    # ── Signal age bonus ─────────────────────────────────────────────────────
+    # Reward stocks that have held a strong signal for multiple consecutive weeks.
+    # +2 pts per week held above MIN_CONFIDENCE, capped at SIGNAL_AGE_BONUS_MAX.
+    if signal_age_weeks >= 2:
+        age_bonus = min(SIGNAL_AGE_BONUS_MAX, (signal_age_weeks - 1) * 2.0)
+        confidence += age_bonus
+        logger.debug(f"{ticker}: signal_age_bonus +{age_bonus:.1f} ({signal_age_weeks} weeks)")
+
     confidence = round(max(0, min(100, confidence)), 1)
 
     # Detect setup type
     setup = detect_setup_type(stock)
 
     stock["confidence"] = confidence
+    stock["gpt_vetoed"] = False
     stock["sub_scores"] = {
         "technical": round(tech, 1),
         "relative_strength": round(rs, 1),
@@ -437,6 +479,7 @@ def score_candidate(
         "earnings_safety": round(earnings, 1),
         "macro": round(macro, 1),
         "ml": round(ml, 1),
+        "signal_age_weeks": signal_age_weeks,
     }
     stock["setup_type"] = setup
 
@@ -488,6 +531,7 @@ def score_candidates(
     fetch_extras: bool = True,
     ml_predictions_map: Optional[Dict[str, Dict[str, Any]]] = None,
     sentiment_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    signal_age_map: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     """Score a list of candidates and return sorted by confidence.
 
@@ -535,6 +579,9 @@ def score_candidates(
         if sentiment_map and ticker in sentiment_map:
             sent_data = sentiment_map[ticker]
 
+        # Per-ticker signal age (weeks of consecutive strong signal)
+        sig_age = signal_age_map.get(ticker, 0) if signal_age_map else 0
+
         scored_candidate = score_candidate(
             c,
             fundamentals=fundamentals,
@@ -543,6 +590,7 @@ def score_candidates(
             ml_predictions=ml_preds,
             sentiment_data=sent_data,
             macro_bias=macro_bias,
+            signal_age_weeks=sig_age,
         )
         scored.append(scored_candidate)
 

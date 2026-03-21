@@ -482,6 +482,147 @@ def activate_model(model_name: str, version_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# stocks.portfolio_holdings
+# ---------------------------------------------------------------------------
+
+def get_portfolio_holdings(status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get current portfolio holdings, optionally filtered by status."""
+    try:
+        q = _table("portfolio_holdings").select("*")
+        if status:
+            q = q.eq("status", status)
+        result = q.order("current_confidence", desc=True).execute()
+        return result.data or []
+    except Exception as e:
+        logger.error(f"get_portfolio_holdings failed: {e}", exc_info=True)
+        return []
+
+
+def upsert_portfolio_holding(holding: Dict[str, Any]) -> bool:
+    """Insert or update a portfolio holding by ticker."""
+    try:
+        holding["updated_at"] = datetime.utcnow().isoformat()
+        _table("portfolio_holdings").upsert(
+            holding, on_conflict="ticker"
+        ).execute()
+        logger.info(
+            f"Upserted portfolio holding: {holding.get('ticker')} "
+            f"status={holding.get('status')} conf={holding.get('current_confidence')}"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"upsert_portfolio_holding failed: {e}", exc_info=True)
+        return False
+
+
+def remove_portfolio_holding(ticker: str) -> bool:
+    """Delete a holding from the portfolio (hard delete — use only on exit)."""
+    try:
+        _table("portfolio_holdings").delete().eq("ticker", ticker).execute()  # noqa: result unused
+        logger.info(f"Removed portfolio holding: {ticker}")
+        return True
+    except Exception as e:
+        logger.error(f"remove_portfolio_holding failed: {e}", exc_info=True)
+        return False
+
+
+def get_portfolio_holding(ticker: str) -> Optional[Dict[str, Any]]:
+    """Get a single portfolio holding by ticker."""
+    try:
+        result = (
+            _table("portfolio_holdings")
+            .select("*")
+            .eq("ticker", ticker)
+            .limit(1)
+            .execute()
+        )
+        data = result.data
+        return data[0] if data else None
+    except Exception as e:
+        logger.error(f"get_portfolio_holding failed: {e}", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# stocks.signal_history
+# ---------------------------------------------------------------------------
+
+def insert_signal_history(records: List[Dict[str, Any]]) -> bool:
+    """Batch upsert weekly signal scores for multiple tickers."""
+    if not records:
+        return True
+    try:
+        _table("signal_history").upsert(
+            records, on_conflict="ticker,scan_date"
+        ).execute()
+        logger.info(f"Upserted {len(records)} signal_history records")
+        return True
+    except Exception as e:
+        logger.error(f"insert_signal_history failed: {e}", exc_info=True)
+        return False
+
+
+def get_signal_history(ticker: str, weeks: int = 4) -> List[Dict[str, Any]]:
+    """Get the last N weeks of signal history for a ticker, newest first."""
+    try:
+        cutoff = (date.today() - timedelta(weeks=weeks)).isoformat()
+        result = (
+            _table("signal_history")
+            .select("scan_date, confidence, in_portfolio, setup_type")
+            .eq("ticker", ticker)
+            .gte("scan_date", cutoff)
+            .order("scan_date", desc=True)
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        logger.error(f"get_signal_history({ticker}) failed: {e}", exc_info=True)
+        return []
+
+
+def get_consecutive_strong_weeks(ticker: str, min_confidence: float) -> int:
+    """Count how many consecutive weeks (ending today) ticker scored >= min_confidence."""
+    history = get_signal_history(ticker, weeks=8)
+    count = 0
+    for row in history:  # newest first
+        if (row.get("confidence") or 0) >= min_confidence:
+            count += 1
+        else:
+            break
+    return count
+
+
+# ---------------------------------------------------------------------------
+# stocks.portfolio_log
+# ---------------------------------------------------------------------------
+
+def log_portfolio_action(
+    ticker: str,
+    action: str,
+    reason: str = "",
+    confidence: Optional[float] = None,
+    prev_status: Optional[str] = None,
+    new_status: Optional[str] = None,
+) -> bool:
+    """Append an entry to the portfolio audit log."""
+    try:
+        row = {
+            "ticker": ticker,
+            "action": action,
+            "reason": reason,
+            "confidence": confidence,
+            "prev_status": prev_status,
+            "new_status": new_status,
+            "scan_date": date.today().isoformat(),
+        }
+        _table("portfolio_log").insert(row).execute()
+        return True
+    except Exception as e:
+        logger.error(f"log_portfolio_action failed: {e}", exc_info=True)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Data maintenance
 # ---------------------------------------------------------------------------
 

@@ -110,8 +110,6 @@ def startup() -> None:
         init_bot()
         init_ok["telegram"] = True
         logger.info("✅ Telegram bot connected")
-        send_alert("bot_start", {})
-        
         from utils.telegram_bot import start_command_listener
         start_command_listener()
     except Exception as e:
@@ -140,14 +138,12 @@ def startup() -> None:
     scheduler.schedule_daily_health_check(agent.daily_health_check)
     scheduler.start()
     logger.info("✅ Scheduler started")
-    
-    return True
 
     # Update status for health endpoint
     next_runs = scheduler.get_next_run_times()
-    update_status("next_weekly_scan", next_runs.get("weekly_scan"))
-    update_status("init_supabase", init_ok["supabase"])
-    update_status("init_telegram", init_ok["telegram"])
+    update_status("next_weekly_scan", next_runs.get("weekly_scan", ""))
+    update_status("init_supabase", str(init_ok["supabase"]))
+    update_status("init_telegram", str(init_ok["telegram"]))
 
     logger.info("=" * 60)
     logger.info("  stocks-agent ready")
@@ -155,6 +151,19 @@ def startup() -> None:
         failed = [k for k, v in init_ok.items() if not v]
         logger.warning(f"  ⚠️  Running in degraded mode — failed: {failed}")
     logger.info("=" * 60)
+
+    # Send startup alert with full system status
+    if init_ok["telegram"]:
+        try:
+            send_alert("bot_start", {
+                "env": env,
+                "dry_run": dry_run,
+                "init_ok": init_ok,
+                "next_weekly_scan": next_runs.get("weekly_scan", "unknown"),
+                "next_morning_briefing": next_runs.get("morning_briefing", "unknown"),
+            })
+        except Exception as e:
+            logger.warning(f"Startup alert failed: {e}")
 
 
 def shutdown() -> None:
