@@ -207,6 +207,9 @@ def send_alert(alert_type: str, data: Dict[str, Any]) -> bool:
             d.get("hot_sectors", []),
             d.get("regime"),
             gpt_briefing=d.get("gpt_briefing"),
+            cross_asset_regime=d.get("cross_asset_regime"),
+            safety=d.get("safety"),
+            combined_size_mod=d.get("combined_size_mod"),
         ),
         # legacy — kept for backward compat
         "weekly_summary": lambda d: format_weekly_summary(
@@ -221,6 +224,7 @@ def send_alert(alert_type: str, data: Dict[str, Any]) -> bool:
             d.get("macro", {}),
             enter_now=d.get("enter_now", []),
             watchlist=d.get("watchlist", []),
+            safety=d.get("safety"),
         ),
         "eod_summary": lambda d: format_eod_summary(d),
         "action_needed": lambda d: format_action_needed(d),
@@ -305,6 +309,9 @@ def format_portfolio_update(
     hot_sectors: Optional[List[str]] = None,
     regime: Optional[Dict[str, Any]] = None,
     gpt_briefing: Optional[str] = None,
+    cross_asset_regime: Optional[Dict[str, Any]] = None,
+    safety: Optional[Dict[str, Any]] = None,
+    combined_size_mod: Optional[float] = None,
 ) -> str:
     """Format the weekly portfolio state-machine update.
 
@@ -330,6 +337,34 @@ def format_portfolio_update(
 
     if hot_sectors:
         lines.append(f"Leading sectors: {', '.join(hot_sectors[:3])}")
+        lines.append("")
+
+    # Cross-asset regime + breadth gate context
+    if cross_asset_regime:
+        cr = cross_asset_regime.get("regime", "")
+        cr_score = cross_asset_regime.get("score", 0)
+        cr_mod = cross_asset_regime.get("position_size_modifier", 1.0)
+        regime_emojis = {
+            "broadening": "🟢", "concentration": "🟡", "transitional": "🟡",
+            "inflationary": "🟠", "contraction": "🔴",
+        }
+        re = regime_emojis.get(cr, "⚪")
+        lines.append(f"Regime: {re} {cr.title()} (score {cr_score:.0f}  size×{cr_mod:.2f})")
+
+    if safety:
+        breadth_pct = safety.get("breadth", {}).get("pct_above_200", 0)
+        top_risk = safety.get("top", {}).get("top_risk", "low")
+        gate_ok = safety.get("safe_to_enter", True)
+        gate_str = "✅ Gate open" if gate_ok else "🔴 Gate CLOSED"
+        dist_str = f"{safety.get('top', {}).get('distribution_days', 0)}d dist"
+        lines.append(
+            f"Breadth: {breadth_pct:.0f}% above 200MA  |  {dist_str}  |  {gate_str}"
+        )
+
+    if combined_size_mod is not None and combined_size_mod < 1.0:
+        lines.append(f"Position sizing: {combined_size_mod:.0%} of normal (regime+breadth penalty)")
+
+    if cross_asset_regime or safety:
         lines.append("")
 
     if gpt_briefing:
@@ -508,6 +543,7 @@ def format_morning_briefing(
     macro: Optional[Dict[str, Any]] = None,
     enter_now: Optional[List[Dict[str, Any]]] = None,
     watchlist: Optional[List[Dict[str, Any]]] = None,
+    safety: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Format the daily morning briefing with a clear action plan.
 
@@ -578,7 +614,23 @@ def format_morning_briefing(
             )
         lines.append("")
 
-    # ── 4. MACRO / EVENTS ────────────────────────────────────────────────────
+    # ── 4. BREADTH / SAFETY ──────────────────────────────────────────────────
+    if safety:
+        breadth_pct = safety.get("breadth", {}).get("pct_above_200", 0)
+        top_risk = safety.get("top", {}).get("top_risk", "low")
+        dist_days = safety.get("top", {}).get("distribution_days", 0)
+        gate_ok = safety.get("safe_to_enter", True)
+        risk_emojis = {"low": "🟢", "medium": "🟡", "high": "🔴"}
+        re = risk_emojis.get(top_risk, "⚪")
+        gate_str = "✅ entries open" if gate_ok else "🔴 entries PAUSED"
+        lines.append(
+            f"Market: {breadth_pct:.0f}% stocks above 200MA  |  {dist_days} dist days  |  {gate_str} {re}"
+        )
+        if not gate_ok:
+            lines.append(f"  ⚠️ {safety.get('summary', '')}")
+        lines.append("")
+
+    # ── 5. MACRO / EVENTS ────────────────────────────────────────────────────
     if events:
         lines.append(f"{EMOJI['warning']} Market events:")
         for ev in events:
@@ -654,25 +706,30 @@ def format_eod_summary(data: Dict[str, Any]) -> str:
 def format_action_needed(data: Dict[str, Any]) -> str:
     """Format an urgent action-needed alert."""
     ticker = data.get("ticker", "???")
+    action = data.get("action", "")
     reason = data.get("reason", "")
-    options = data.get("options", [])
-    recommendation = data.get("recommendation", "")
+    current_price = data.get("current_price", 0)
+    pnl = data.get("pnl", 0)
+    pnl_pct = data.get("pnl_pct", 0)
+
+    sign = "+" if pnl >= 0 else ""
+    pnl_emoji = EMOJI["bullish"] if pnl >= 0 else EMOJI["bearish"]
 
     lines = [
         f"{EMOJI['action']} ACTION NEEDED — {ticker}",
         "",
-        reason,
-        "",
     ]
 
-    if options:
-        lines.append("Options:")
-        for i, opt in enumerate(options, 1):
-            lines.append(f"  {i}. {opt}")
+    if action:
+        lines.append(f"{action}")
         lines.append("")
 
-    if recommendation:
-        lines.append(f"Bot recommendation: {recommendation}")
+    lines.append(reason)
+    lines.append("")
+
+    if current_price:
+        lines.append(f"  Price: ${current_price:.2f}")
+    lines.append(f"  P&L: {pnl_emoji} {sign}${pnl:,.2f} ({sign}{pnl_pct:.1f}%)")
 
     return "\n".join(lines)
 

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from agent.persistence import insert_event, get_recent_events
+from agent.regime_engine import get_cached_regime
 
 logger = logging.getLogger(__name__)
 
@@ -307,11 +308,27 @@ def assess_market_regime(
     elif spy_change >= 3:
         desc += f" | SPY rallied +{spy_change:.1f}%"
 
+    # Blend with cross-asset regime modifier when available
+    cross = get_cached_regime()
+    if cross:
+        cross_mod = cross.get("position_size_modifier", 1.0)
+        # Geometric blend: take the more conservative of VIX and cross-asset
+        blended = round(size_mod * cross_mod, 2)
+        cross_regime = cross.get("regime", "")
+        cross_desc = cross.get("description", "")
+    else:
+        blended = round(size_mod, 2)
+        cross_regime = ""
+        cross_desc = ""
+
     return {
         "regime": regime,
         "mood": mood,
         "risk_level": risk_level,
-        "position_size_modifier": round(size_mod, 2),
+        "position_size_modifier": blended,
+        "vix_size_modifier": round(size_mod, 2),
+        "cross_asset_regime": cross_regime,
+        "cross_asset_description": cross_desc,
         "vix": vix,
         "spy_change_pct": spy_change,
         "description": desc,

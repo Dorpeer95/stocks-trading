@@ -20,6 +20,9 @@ from typing import Any, Dict, List, Optional
 
 from agent.ai_model import ModelManager
 from agent.events import detect_and_persist_events, assess_market_regime
+from agent.regime_engine import assess_regime
+from agent.market_safety import get_market_safety
+from agent.stagnation_detector import scan_for_stagnation
 from agent.persistence import (
     get_open_positions,
     get_pending_opportunities,
@@ -42,6 +45,7 @@ from agent.scanner import scan_universe, filter_by_ml_direction
 from agent.scorer import build_opportunity, score_candidates, ENABLE_ML, MIN_CONFIDENCE
 from health import update_status, get_status, check_memory
 from utils.data_loader import fetch_macro_data, clear_cache
+from utils.helpers import safe_float
 from utils.sentiment import (
     aggregate_sentiment,
     batch_sentiment,
@@ -126,13 +130,35 @@ class AgentLoop:
                 update_status("last_scan", time.strftime("%Y-%m-%dT%H:%M:%S"))
                 return
 
-            # 2. Macro data + regime
+            # 2. Cross-asset regime (force refresh on weekly scan)
+            cross_regime = assess_regime(force_refresh=True)
+            logger.info(
+                f"Cross-asset regime: {cross_regime['regime']} "
+                f"score={cross_regime['score']:.0f} "
+                f"size_mod={cross_regime['position_size_modifier']:.2f}"
+            )
+
+            # 3. Macro data + VIX regime (now blended with cross-asset via events.py)
             macro = fetch_macro_data()
             events, regime = detect_and_persist_events(macro) if macro else ([], None)
             self._last_regime = regime
             self._last_events = events
 
-            # 3. ML pre-filter (Phase 3) — skip in emergency mode
+            # 3b. Market safety gate (breadth + distribution)
+            safety = get_market_safety()
+            logger.info(
+                f"Market safety: safe={safety['safe_to_enter']} "
+                f"size_mod={safety['size_modifier']:.2f} — {safety['summary']}"
+            )
+            if not safety["safe_to_enter"]:
+                logger.warning(f"Market safety GATE TRIGGERED — {safety['summary']}")
+                send_alert("action_needed", {
+                    "ticker": "MARKET",
+                    "action": "Entry gate active — new entries paused",
+                    "reason": safety["summary"],
+                })
+
+            # 4. ML pre-filter (Phase 3) — skip in emergency mode
             emergency = mem.get("emergency_mode", False)
             ml_predictions_map: Dict[str, Dict[str, Any]] = {}
             if ENABLE_ML and self._models_loaded and not emergency:
@@ -203,6 +229,19 @@ class AgentLoop:
                 except Exception as e:
                     logger.warning(f"signal_history insert failed: {e}")
 
+            # 7b. Auto-calibrate signal weights (once we have ≥20 postmortems)
+            if not DRY_RUN:
+                try:
+                    from agent.weight_calibrator import calibrate_weights
+                    calibration = calibrate_weights(min_sample=20)
+                    if calibration:
+                        logger.info(
+                            f"Weight calibration complete: "
+                            f"{calibration['weights']}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Weight calibration failed: {e}")
+
             # 8. Run portfolio state machine — the core managed-portfolio logic
             portfolio_diff: Dict[str, Any] = {}
             try:
@@ -213,10 +252,29 @@ class AgentLoop:
             # 9. Build opportunities from portfolio new_entries + active holdings
             #    (for Alpaca execution and legacy persistence)
             opportunities: List[Dict[str, Any]] = []
+
+            # Compute combined size modifier: regime × safety breadth
+            regime_size_mod = regime.get("position_size_modifier", 1.0) if regime else 1.0
+            combined_size_mod = round(regime_size_mod * safety["size_modifier"], 2)
+
+            # Gate: skip new entries entirely if safety gate triggered
+            allow_new_entries = safety["safe_to_enter"]
+
             entry_tickers = {c["ticker"] for c in portfolio_diff.get("new_entries", [])}
             scored_map = {s["ticker"]: s for s in scored if s.get("ticker")}
             for stock in portfolio_diff.get("new_entries", []):
-                opp = build_opportunity(stock, portfolio_value=PORTFOLIO_VALUE, regime=regime)
+                if not allow_new_entries:
+                    logger.warning(
+                        f"Skipping new entry {stock.get('ticker')} — "
+                        "market safety gate active"
+                    )
+                    continue
+                # Pass combined modifier so position sizer respects regime + breadth
+                opp_regime = dict(regime) if regime else {}
+                opp_regime["position_size_modifier"] = combined_size_mod
+                opp = build_opportunity(
+                    stock, portfolio_value=PORTFOLIO_VALUE, regime=opp_regime
+                )
                 opportunities.append(opp)
 
             if opportunities and not DRY_RUN:
@@ -264,6 +322,9 @@ class AgentLoop:
                 "market_mood": mood,
                 "hot_sectors": scan.get("hot_sectors", []),
                 "regime": regime,
+                "cross_asset_regime": cross_regime,
+                "safety": safety,
+                "combined_size_mod": combined_size_mod,
             }
             if gpt_briefing:
                 alert_data["gpt_briefing"] = gpt_briefing
@@ -340,10 +401,10 @@ class AgentLoop:
                 for opp in pending[:8]:  # check top 8 by confidence
                     ticker = opp.get("ticker")
                     # entry_price may be null on old rows — fall back to low/high avg
-                    entry_price = float(opp.get("entry_price") or 0)
+                    entry_price = safe_float(opp.get("entry_price"))
                     if not entry_price:
-                        low = float(opp.get("entry_price_low") or 0)
-                        high = float(opp.get("entry_price_high") or 0)
+                        low = safe_float(opp.get("entry_price_low"))
+                        high = safe_float(opp.get("entry_price_high"))
                         entry_price = round((low + high) / 2, 2) if (low or high) else 0
                     if not ticker or not entry_price or ticker in open_tickers:
                         continue
@@ -359,8 +420,8 @@ class AgentLoop:
                             "ticker": ticker,
                             "current_price": current,
                             "entry_price": entry_price,
-                            "stop_loss": float(opp.get("stop_loss") or 0),
-                            "target_price": float(opp.get("target_price") or 0),
+                            "stop_loss": safe_float(opp.get("stop_loss")),
+                            "target_price": safe_float(opp.get("target_price")),
                             "confidence": opp.get("confidence", 0),
                             "distance_pct": distance_pct,
                             "notes": opp.get("notes", ""),
@@ -387,12 +448,16 @@ class AgentLoop:
             # Macro summary (pass full dicts so formatter can read change_pct)
             macro_summary = macro or {}
 
+            # Breadth / safety snapshot for morning context
+            morning_safety = get_market_safety()
+
             send_alert("morning_briefing", {
                 "events": event_texts,
                 "positions": pos_details,
                 "macro": macro_summary,
                 "enter_now": enter_now,
                 "watchlist": watchlist,
+                "safety": morning_safety,
             })
 
             update_status(
@@ -418,8 +483,20 @@ class AgentLoop:
             # 1. Exit checks on open positions
             actions = update_positions_intraday()
 
+            # 1b. Stagnation scan — reuse positions already fetched by update_positions_intraday
+            try:
+                _positions_for_stagnation = get_open_positions()
+                stagnant = scan_for_stagnation(_positions_for_stagnation)
+                for sa in stagnant:
+                    cache_key = f"stagnant_{sa['ticker']}"
+                    if time.time() - self._entry_alert_cache.get(cache_key, 0) > 86400:
+                        actions.append(sa)
+                        self._entry_alert_cache[cache_key] = time.time()
+            except Exception as e:
+                logger.debug(f"Stagnation scan failed: {e}")
+
             for action in actions:
-                urgency = action.get("urgency", "medium")
+                urgency = action.get("urgent", "medium")
                 if urgency in ("high", "medium"):
                     send_alert("action_needed", action)
                     logger.info(
@@ -429,15 +506,15 @@ class AgentLoop:
 
             # 2. Entry trigger checks on watchlist
             try:
-                open_tickers = {p.get("ticker") for p in get_open_positions()}
+                open_tickers = {p.get("ticker") for p in _positions_for_stagnation}
                 pending = get_pending_opportunities()
 
                 for opp in pending[:8]:
                     ticker = opp.get("ticker")
-                    entry_price = float(opp.get("entry_price") or 0)
+                    entry_price = safe_float(opp.get("entry_price"))
                     if not entry_price:
-                        low = float(opp.get("entry_price_low") or 0)
-                        high = float(opp.get("entry_price_high") or 0)
+                        low = safe_float(opp.get("entry_price_low"))
+                        high = safe_float(opp.get("entry_price_high"))
                         entry_price = round((low + high) / 2, 2) if (low or high) else 0
                     if not ticker or not entry_price or ticker in open_tickers:
                         continue
@@ -460,8 +537,8 @@ class AgentLoop:
                                 "ticker": ticker,
                                 "current_price": current,
                                 "entry_price": entry_price,
-                                "stop_loss": float(opp.get("stop_loss") or 0),
-                                "target_price": float(opp.get("target_price") or 0),
+                                "stop_loss": safe_float(opp.get("stop_loss")),
+                                "target_price": safe_float(opp.get("target_price")),
                                 "confidence": opp.get("confidence", 0),
                                 "notes": opp.get("notes", ""),
                             })
@@ -560,7 +637,7 @@ class AgentLoop:
             
             msg = f"🟢 Daily Health Check: Bot is running smoothly.\n"
             msg += f"Memory Usage: {mem_pct:.1f}%\n"
-            msg += f"Open Positions: len({len(get_open_positions())})"
+            msg += f"Open Positions: {len(get_open_positions())}"
             
             send_message(msg)
             

@@ -433,6 +433,13 @@ def fetch_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
             "revenue_growth": info.get("revenueGrowth"),
             "profit_margin": info.get("profitMargins"),
             "earnings_date": None,
+            # Layer 2: CANSLIM + institutional flow
+            "earnings_quarterly_growth": info.get("earningsQuarterlyGrowth"),
+            "held_pct_institutions": info.get("heldPercentInstitutions"),
+            "held_pct_insiders": info.get("heldPercentInsiders"),
+            "eps_trailing": info.get("trailingEps"),
+            "eps_forward": info.get("forwardEps"),
+            "return_on_equity": info.get("returnOnEquity"),
         }
 
         # Try to get earnings date from calendar

@@ -84,8 +84,16 @@ def check_memory() -> Dict[str, Any]:
             f"Memory CRITICAL: {mem:.0f} MB — enabling emergency mode"
         )
 
+    # Calculate memory percentage using total system memory
+    try:
+        total_mb = psutil.virtual_memory().total / (1024 * 1024)
+        percent = round((mem / total_mb) * 100, 1) if mem > 0 and total_mb > 0 else 0.0
+    except Exception:
+        percent = 0.0
+
     return {
         "memory_mb": mem,
+        "percent": percent,
         "warning": warning,
         "critical": critical,
         "emergency_mode": _status_data.get("emergency_mode", False),

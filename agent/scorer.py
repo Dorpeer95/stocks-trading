@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Optional
 from utils.earnings import earnings_risk_flag, fetch_earnings_history, calc_beat_streak
 from utils.insider import get_insider_signal
 from agent.macro_events import get_macro_bias, apply_macro_bias
+from agent.canslim_scorer import score_canslim
+from agent.institutional_scorer import get_institutional_score
+from agent.earnings_intelligence import enhanced_earnings_score
 
 logger = logging.getLogger(__name__)
 
@@ -396,9 +399,21 @@ def score_candidate(
     if skip_api_calls:
         insider = 50.0
         earnings = 60.0
+        canslim_result = {"score": 50.0, "components": {}, "criteria_met": 0}
+        inst_result = {"score_adjustment": 0, "signal": "unknown"}
+        earnings_result = {"score": 60.0, "pead_detected": False, "beat_streak": 0}
     else:
-        insider = score_insider(ticker)
-        earnings = score_earnings_risk(ticker)
+        # ── Enhanced insider: base + institutional flow adjustment ────────────
+        insider_base = score_insider(ticker)
+        inst_result = get_institutional_score(ticker, fundamentals)
+        insider = min(100, max(0, insider_base + inst_result["score_adjustment"]))
+
+        # ── Enhanced earnings: more aggressive penalties + PEAD detection ─────
+        earnings_result = enhanced_earnings_score(ticker, stock)
+        earnings = earnings_result["score"]
+
+        # ── CANSLIM sub-score (zero extra API calls — uses fundamentals) ──────
+        canslim_result = score_canslim(stock, fundamentals)
 
     macro = score_macro(regime)
     
@@ -455,6 +470,20 @@ def score_candidate(
         + ml * W_ML
     )
 
+    # ── Dual-confirmation bonus: VCP + CANSLIM both strong ───────────────────
+    # When two independent methodologies agree, conviction is higher.
+    canslim_score = canslim_result.get("score", 0)
+    if tech >= 70 and canslim_score >= 70:
+        confidence += 5
+        logger.debug(f"{ticker}: dual-confirmation bonus +5 (tech={tech:.0f} canslim={canslim_score:.0f})")
+
+    # ── PEAD fast-track flag (stored on stock, read by portfolio_manager) ─────
+    if earnings_result.get("pead_detected"):
+        stock["pead_detected"] = True
+        stock["pead_bonus"] = 3       # small confidence lift for PEAD plays
+        confidence += 3
+        logger.info(f"{ticker}: PEAD detected — +3 confidence bonus")
+
     # ── Signal age bonus ─────────────────────────────────────────────────────
     # Reward stocks that have held a strong signal for multiple consecutive weeks.
     # +2 pts per week held above MIN_CONFIDENCE, capped at SIGNAL_AGE_BONUS_MAX.
@@ -479,7 +508,17 @@ def score_candidate(
         "earnings_safety": round(earnings, 1),
         "macro": round(macro, 1),
         "ml": round(ml, 1),
+        "canslim": round(canslim_score, 1),
         "signal_age_weeks": signal_age_weeks,
+        # Institutional flow metadata
+        "institutional_signal": inst_result.get("signal", "unknown"),
+        "institutional_pct": inst_result.get("institutional_pct"),
+        # Earnings metadata
+        "pead_detected": earnings_result.get("pead_detected", False),
+        "beat_streak": earnings_result.get("beat_streak", 0),
+        "days_to_earnings": earnings_result.get("days_to_earnings"),
+        # CANSLIM criteria detail
+        "canslim_criteria_met": canslim_result.get("criteria_met", 0),
     }
     stock["setup_type"] = setup
 

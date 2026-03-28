@@ -18,8 +18,12 @@ from agent.persistence import (
     insert_equity_snapshot,
     get_latest_snapshot,
     get_trade_history,
+    remove_portfolio_holding,
+    log_portfolio_action,
+    get_portfolio_holding,
 )
 from utils.data_loader import fetch_price_data
+from utils.helpers import safe_float, safe_int
 from utils.position_sizing import (
     cash_reserve_check,
     max_position_check,
@@ -77,11 +81,16 @@ def update_positions_intraday() -> List[Dict[str, Any]]:
                 continue
 
             current = float(df["Close"].iloc[-1])
-            entry = pos.get("entry_price", current)
-            stop = pos.get("stop_loss", 0)
-            target = pos.get("target_price", 0)
-            shares = pos.get("shares", 0)
-            trailing = pos.get("trailing_stop", stop)
+            entry = safe_float(pos.get("entry_price"), current)
+            stop = safe_float(pos.get("stop_loss"))
+            target = safe_float(pos.get("target_price"))
+            shares = safe_int(pos.get("shares"))
+            trailing = safe_float(pos.get("trailing_stop"), stop)
+
+            if not stop:
+                logger.warning(f"{ticker}: no stop_loss set — stop check disabled")
+            if not target:
+                logger.warning(f"{ticker}: no target_price set — target check disabled")
 
             # Calculate PnL
             pnl = (current - entry) * shares
@@ -104,6 +113,14 @@ def update_positions_intraday() -> List[Dict[str, Any]]:
                 "unrealized_pnl_pct": round(pnl_pct, 2),
                 "days_held": days_held,
             }
+
+            # MAE/MFE water marks (ratchet only — never move backward)
+            current_high = safe_float(pos.get("high_water_mark"), entry)
+            current_low = safe_float(pos.get("low_water_mark"), entry)
+            if current > current_high:
+                updates["high_water_mark"] = round(current, 2)
+            if current_low == 0 or current < current_low:
+                updates["low_water_mark"] = round(current, 2)
 
             # --- Exit checks ---
             action = None
@@ -168,7 +185,7 @@ def update_positions_intraday() -> List[Dict[str, Any]]:
                     "current_price": current,
                     "pnl": round(pnl, 2),
                     "pnl_pct": round(pnl_pct, 1),
-                    "urgency": "low",
+                    "urgent": "low",
                 }
 
             # 5. Update trailing stop (ratchet up only)
@@ -187,11 +204,21 @@ def update_positions_intraday() -> List[Dict[str, Any]]:
             if pos_id:
                 update_position(pos_id, updates)
 
-            # Record closed trade
+            # Record closed trade + sync portfolio_holdings
             if action and updates.get("status") in (
                 "stopped_out", "trailed_out", "target_hit"
             ):
-                _record_trade(pos, current, updates["status"])
+                # Fetch holding enrichment data BEFORE removal (2.4 postmortem prep)
+                holding_data = get_portfolio_holding(ticker)
+                _record_trade(pos, current, updates["status"], holding_data)
+                # Remove from portfolio_holdings so weekly cycle doesn't
+                # try to re-score a ghost holding (critical desync fix)
+                remove_portfolio_holding(ticker)
+                log_portfolio_action(
+                    ticker, "REMOVED",
+                    reason=f"Intraday exit: {updates['status']}",
+                    prev_status="active", new_status="closed",
+                )
 
             if action:
                 actions.append(action)
@@ -221,11 +248,19 @@ def _record_trade(
     position: Dict[str, Any],
     exit_price: float,
     exit_reason: str,
+    holding_data: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Record a closed trade in the trades table."""
+    """Record a closed trade in the trades table.
+
+    Parameters
+    ----------
+    holding_data : portfolio_holdings row fetched before removal — provides
+                   entry_confidence, sub_scores_at_entry, setup_type, and
+                   regime context for Layer 4 postmortem recording.
+    """
     try:
-        entry_price = position.get("entry_price", exit_price)
-        shares = position.get("shares", 0)
+        entry_price = safe_float(position.get("entry_price"), exit_price)
+        shares = safe_int(position.get("shares"))
         realized_pnl = (exit_price - entry_price) * shares
 
         trade = {
@@ -242,9 +277,30 @@ def _record_trade(
                 2,
             ),
             "exit_reason": exit_reason,
-            "hold_days": position.get("days_held", 0),
+            "hold_days": safe_int(position.get("days_held")),
         }
+
+        # MAE/MFE from water marks (set by update_positions_intraday)
+        high_mark = safe_float(position.get("high_water_mark"), entry_price)
+        low_mark = safe_float(position.get("low_water_mark"), entry_price)
+        if entry_price > 0:
+            trade["mfe_pct"] = round((high_mark - entry_price) / entry_price * 100, 2)
+            trade["mae_pct"] = round((entry_price - low_mark) / entry_price * 100, 2)
+
+        # Enrich with portfolio holding context (Layer 2.4 / Layer 4 prep)
+        if holding_data:
+            trade["entry_confidence"] = holding_data.get("entry_confidence")
+            trade["sub_scores_at_entry"] = holding_data.get("sub_scores")
+            trade["setup_type"] = holding_data.get("setup_type")
+
         insert_trade(trade)
+
+        # Trigger postmortem recording (non-blocking)
+        try:
+            from agent.postmortem import record_postmortem
+            record_postmortem(trade, position, holding_data)
+        except Exception as pm_e:
+            logger.debug(f"Postmortem record skipped: {pm_e}")
     except Exception as e:
         logger.error(f"Failed to record trade: {e}")
 
@@ -266,13 +322,13 @@ def get_portfolio_summary() -> Dict[str, Any]:
     trade_history = get_trade_history(limit=100)
 
     total_invested = sum(
-        (p.get("shares", 0) * p.get("entry_price", 0)) for p in positions
+        safe_float(p.get("shares")) * safe_float(p.get("entry_price")) for p in positions
     )
     total_risk = sum(
-        (p.get("shares", 0) * (p.get("entry_price", 0) - p.get("stop_loss", 0)))
+        safe_float(p.get("shares")) * (safe_float(p.get("entry_price")) - safe_float(p.get("stop_loss")))
         for p in positions
     )
-    total_unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
+    total_unrealized = sum(safe_float(p.get("unrealized_pnl")) for p in positions)
 
     cash_available = PORTFOLIO_VALUE - total_invested
     cash_pct = cash_available / PORTFOLIO_VALUE if PORTFOLIO_VALUE > 0 else 0
@@ -318,6 +374,82 @@ def get_portfolio_summary() -> Dict[str, Any]:
         "kelly_fraction": round(
             half_kelly(win_rate, avg_win, avg_loss), 4
         ) if total_trades >= 10 else None,
+    }
+
+
+def get_exposure_summary() -> Dict[str, Any]:
+    """Analyse portfolio concentration by sector and single-name exposure.
+
+    Returns
+    -------
+    Dict with:
+      ``sector_weights``       — {sector: pct_of_invested}
+      ``top_name_pct``         — single largest position as % of portfolio
+      ``concentrated_sectors`` — sectors >40% of invested
+      ``concentration_risk``   — "low" | "medium" | "high"
+      ``warnings``             — list of human-readable risk flags
+    """
+    positions = get_open_positions()
+    if not positions:
+        return {
+            "sector_weights": {},
+            "top_name_pct": 0.0,
+            "concentrated_sectors": [],
+            "concentration_risk": "low",
+            "warnings": [],
+        }
+
+    total_invested = sum(
+        safe_float(p.get("shares")) * safe_float(p.get("entry_price")) for p in positions
+    )
+    if total_invested == 0:
+        return {
+            "sector_weights": {},
+            "top_name_pct": 0.0,
+            "concentrated_sectors": [],
+            "concentration_risk": "low",
+            "warnings": [],
+        }
+
+    # Sector aggregation — uses sector field if available, else "Unknown"
+    sector_totals: Dict[str, float] = {}
+    name_weights: Dict[str, float] = {}
+
+    for pos in positions:
+        invested = safe_float(pos.get("shares")) * safe_float(pos.get("entry_price"))
+        sector = pos.get("sector") or "Unknown"
+        sector_totals[sector] = sector_totals.get(sector, 0.0) + invested
+        name_weights[pos.get("ticker", "?")] = invested / total_invested * 100
+
+    sector_weights = {
+        k: round(v / total_invested * 100, 1)
+        for k, v in sector_totals.items()
+    }
+
+    concentrated = [s for s, w in sector_weights.items() if w >= 40.0]
+    top_name_pct = round(max(name_weights.values()), 1) if name_weights else 0.0
+
+    warnings = []
+    if concentrated:
+        warnings.append(f"Sector concentration ≥40%: {', '.join(concentrated)}")
+    if top_name_pct > 25.0:
+        warnings.append(f"Single-name risk: top position = {top_name_pct:.0f}% of portfolio")
+    if len(positions) <= 2 and total_invested / PORTFOLIO_VALUE > 0.3:
+        warnings.append("Under-diversified: only 1-2 positions with >30% deployed")
+
+    if len(warnings) >= 2 or (concentrated and top_name_pct > 25):
+        risk_level = "high"
+    elif warnings:
+        risk_level = "medium"
+    else:
+        risk_level = "low"
+
+    return {
+        "sector_weights": sector_weights,
+        "top_name_pct": top_name_pct,
+        "concentrated_sectors": concentrated,
+        "concentration_risk": risk_level,
+        "warnings": warnings,
     }
 
 
@@ -385,18 +517,33 @@ def execute_buy_opportunities(opportunities: List[Dict[str, Any]]) -> None:
         if order_receipt or (not ENABLE_TRADING and os.getenv("STOCKS_DRY_RUN", "false").lower() == "true"):
             # Reconstruct the position dictionary for database insertion
             entry_price = opp.get("entry_price") or (
-                (opp.get("entry_price_low", 0) + opp.get("entry_price_high", 0)) / 2 
-                if opp.get("entry_price_low") and opp.get("entry_price_high") else 0
+                (opp.get("entry_price_low", 0) + opp.get("entry_price_high", 0)) / 2
+                if opp.get("entry_price_low") and opp.get("entry_price_high") else None
             )
+
+            if not entry_price:
+                logger.warning(f"Skipping position for {ticker}: no valid entry price")
+                continue
+
+            stop_loss = safe_float(opp.get("stop_loss")) or None
+            target_price = safe_float(opp.get("target_price")) or None
+
+            if not stop_loss or not target_price:
+                logger.warning(f"{ticker}: missing stop_loss or target_price — position may not exit properly")
+
+            # Pull sector from portfolio_holdings (written during weekly scan)
+            _holding = get_portfolio_holding(ticker)
+            _sector = _holding.get("sector") if _holding else None
 
             position = {
                 "ticker": ticker,
                 "entry_price": entry_price,
                 "shares": int(shares),
-                "stop_loss": opp.get("stop_loss"),
-                "target_price": opp.get("target_price"),
+                "stop_loss": stop_loss,
+                "target_price": target_price,
                 "entry_date": date.today().isoformat(),
                 "status": "open",
+                "sector": _sector,
             }
             insert_position(position)
             existing_tickers.add(ticker)
@@ -419,13 +566,13 @@ def generate_eod_summary() -> Dict[str, Any]:
     for pos in positions:
         position_details.append({
             "ticker": pos.get("ticker"),
-            "current_price": pos.get("current_price"),
-            "entry_price": pos.get("entry_price"),
-            "unrealized_pnl": pos.get("unrealized_pnl", 0),
-            "unrealized_pnl_pct": pos.get("unrealized_pnl_pct", 0),
-            "days_held": pos.get("days_held", 0),
-            "stop_loss": pos.get("stop_loss"),
-            "target_price": pos.get("target_price"),
+            "current_price": safe_float(pos.get("current_price")),
+            "entry_price": safe_float(pos.get("entry_price")),
+            "unrealized_pnl": safe_float(pos.get("unrealized_pnl")),
+            "unrealized_pnl_pct": safe_float(pos.get("unrealized_pnl_pct")),
+            "days_held": safe_int(pos.get("days_held")),
+            "stop_loss": safe_float(pos.get("stop_loss")),
+            "target_price": safe_float(pos.get("target_price")),
         })
 
     return {
@@ -433,7 +580,10 @@ def generate_eod_summary() -> Dict[str, Any]:
         "portfolio_value": summary["portfolio_value"],
         "total_invested": summary["total_invested"],
         "cash_available": summary["cash_available"],
-        "total_unrealized_pnl": summary["total_unrealized_pnl"],
+        "total_pnl": summary["total_unrealized_pnl"],
+        "total_pnl_pct": round(
+            summary["total_unrealized_pnl"] / summary["portfolio_value"] * 100, 1
+        ) if summary["portfolio_value"] > 0 else 0,
         "open_positions": summary["open_positions"],
         "positions": position_details,
         "risk_pct": summary["risk_pct"],

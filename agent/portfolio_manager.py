@@ -26,6 +26,7 @@ import logging
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.regime_engine import get_cached_regime
 from agent.persistence import (
     get_portfolio_holdings,
     get_portfolio_holding,
@@ -34,6 +35,7 @@ from agent.persistence import (
     log_portfolio_action,
     get_consecutive_strong_weeks,
 )
+from utils.helpers import safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +147,7 @@ def _update_existing_holdings(
 
         # Get fresh confidence — use scored_map if available, else keep prev
         if ticker in scored_map:
-            new_conf = float(scored_map[ticker].get("confidence", 0) or 0)
+            new_conf = safe_float(scored_map[ticker].get("confidence"))
             sub_scores = scored_map[ticker].get("sub_scores", {})
             setup_type = scored_map[ticker].get("setup_type", "")
             gpt_vetoed = scored_map[ticker].get("gpt_vetoed", False)
@@ -296,7 +298,7 @@ def _find_entries(
             break
 
         ticker = candidate["ticker"]
-        confidence = float(candidate.get("confidence", 0) or 0)
+        confidence = safe_float(candidate.get("confidence"))
 
         if confidence < ENTRY_THRESHOLD:
             continue  # already sorted, no need to check lower entries
@@ -314,6 +316,7 @@ def _find_entries(
             continue
 
         # ✅ Qualifies — add to portfolio
+        _regime = get_cached_regime()
         holding = {
             "ticker": ticker,
             "status": "active",
@@ -326,6 +329,7 @@ def _find_entries(
             "added_at": scan_date,
             "last_scored_at": scan_date,
             "sector": candidate.get("sector"),
+            "regime_at_entry": _regime.get("regime", "unknown") if _regime else "unknown",
             "entry_price": candidate.get("entry_price_low") or candidate.get("close"),
             "stop_loss": candidate.get("stop_loss"),
             "target_price": candidate.get("target_price"),
@@ -368,14 +372,14 @@ def _find_displacements(
         current_holdings,
         key=lambda h: h.get("current_confidence") or 0,
     )
-    weak_conf = float(weakest.get("current_confidence") or 0)
+    weak_conf = safe_float(weakest.get("current_confidence"))
 
     displacements = []
     for candidate in scored_map.values():
         ticker = candidate["ticker"]
         if ticker in active_tickers:
             continue
-        new_conf = float(candidate.get("confidence", 0) or 0)
+        new_conf = safe_float(candidate.get("confidence"))
         gap = new_conf - weak_conf
         if gap >= DISPLACEMENT_GAP:
             displacements.append({

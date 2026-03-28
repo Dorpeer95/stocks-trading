@@ -289,6 +289,11 @@ def insert_trade(trade: Dict[str, Any]) -> bool:
             "exit_reason": trade.get("exit_reason"),
             "setup_type": trade.get("setup_type"),
             "hold_days": trade.get("hold_days") or trade.get("days_held"),
+            # Layer 4 analytics (migration_003 columns)
+            "mae_pct": trade.get("mae_pct"),
+            "mfe_pct": trade.get("mfe_pct"),
+            "entry_confidence": trade.get("entry_confidence"),
+            "sub_scores_at_entry": trade.get("sub_scores_at_entry"),
         }
         _table("trades").insert(row).execute()
         logger.info(
