@@ -21,7 +21,6 @@ joblib==1.3.2
 
 # Database
 supabase==2.3.4
-postgrest==0.16.1
 
 # Telegram
 python-telegram-bot==20.7
