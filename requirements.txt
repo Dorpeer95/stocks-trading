@@ -7,9 +7,9 @@ uvicorn==0.27.0
 python-dotenv==1.0.1
 
 # Data
-yfinance==1.2.0
-pandas==2.2.0
-numpy==1.26.3
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.24.0
 
 # Technical Analysis
 ta==0.11.0
@@ -45,4 +45,4 @@ psutil==5.9.8
 # Utilities
 beautifulsoup4==4.12.3
 lxml==5.1.0
-alpaca-trade-api==3.2.0
+alpaca-trade-api>=3.0.0
