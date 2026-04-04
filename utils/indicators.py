@@ -6,7 +6,7 @@ and return computed indicator values. No API calls, no side effects.
 """
 
 import logging
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import pandas as pd
