@@ -191,129 +191,90 @@
       "shell": "zsh"
     },
     "modelPreferences": {
-      "default": "claude-opus-4-6",
+      "default": "claude-sonnet-4-6",
       "routing": "claude-haiku-4-5-20251001"
     },
     "agentTeams": {
       "enabled": true,
-      "teammateMode": "auto",
+      "teammateMode": "manual",
       "taskListEnabled": true,
       "mailboxEnabled": true,
       "coordination": {
-        "autoAssignOnIdle": true,
-        "trainPatternsOnComplete": true,
+        "autoAssignOnIdle": false,
+        "trainPatternsOnComplete": false,
         "notifyLeadOnComplete": true,
         "sharedMemoryNamespace": "agent-teams"
       },
       "hooks": {
         "teammateIdle": {
-          "enabled": true,
-          "autoAssign": true,
-          "checkTaskList": true
+          "enabled": false,
+          "autoAssign": false,
+          "checkTaskList": false
         },
         "taskCompleted": {
           "enabled": true,
-          "trainPatterns": true,
+          "trainPatterns": false,
           "notifyLead": true
         }
       }
     },
     "swarm": {
       "topology": "hierarchical-mesh",
-      "maxAgents": 15
+      "maxAgents": 5
     },
     "memory": {
-      "backend": "hybrid",
-      "enableHNSW": true,
+      "backend": "sqlite",
+      "enableHNSW": false,
       "learningBridge": {
-        "enabled": true
+        "enabled": false
       },
       "memoryGraph": {
-        "enabled": true
+        "enabled": false
       },
       "agentScopes": {
         "enabled": true
       }
     },
     "neural": {
-      "enabled": true
+      "enabled": false
     },
     "daemon": {
-      "autoStart": true,
+      "autoStart": false,
       "workers": [
         "map",
-        "audit",
-        "optimize",
-        "consolidate",
-        "testgaps",
-        "ultralearn",
-        "deepdive",
-        "document",
-        "refactor",
-        "benchmark"
+        "audit"
       ],
       "schedules": {
         "audit": {
-          "interval": "1h",
-          "priority": "critical"
-        },
-        "optimize": {
-          "interval": "30m",
-          "priority": "high"
-        },
-        "consolidate": {
-          "interval": "2h",
-          "priority": "low"
-        },
-        "document": {
-          "interval": "1h",
-          "priority": "normal",
-          "triggers": [
-            "adr-update",
-            "api-change"
-          ]
-        },
-        "deepdive": {
           "interval": "4h",
-          "priority": "normal",
-          "triggers": [
-            "complex-change"
-          ]
-        },
-        "ultralearn": {
-          "interval": "1h",
           "priority": "normal"
         }
       }
     },
     "learning": {
-      "enabled": true,
-      "autoTrain": true,
-      "patterns": [
-        "coordination",
-        "optimization",
-        "prediction"
-      ],
+      "enabled": false,
+      "autoTrain": false,
+      "patterns": [],
       "retention": {
         "shortTerm": "24h",
         "longTerm": "30d"
       }
     },
     "adr": {
-      "autoGenerate": true,
+      "autoGenerate": false,
       "directory": "/docs/adr",
       "template": "madr"
     },
     "ddd": {
-      "trackDomains": true,
-      "validateBoundedContexts": true,
+      "trackDomains": false,
+      "validateBoundedContexts": false,
       "directory": "/docs/ddd"
     },
     "security": {
-      "autoScan": true,
-      "scanOnEdit": true,
-      "cveCheck": true,
-      "threatModel": true
+      "autoScan": false,
+      "scanOnEdit": false,
+      "cveCheck": false,
+      "threatModel": false
     }
   }
 }

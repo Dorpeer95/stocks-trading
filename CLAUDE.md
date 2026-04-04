@@ -186,3 +186,12 @@ npx @claude-flow/cli@latest doctor --fix
 
 - Documentation: https://github.com/ruvnet/claude-flow
 - Issues: https://github.com/ruvnet/claude-flow/issues
+
+
+## Auto-Trigger Skills (stocks-trading-Specific)
+
+### Performance Audit (`performance-audit`)
+Automatically use whenever:
+- The user mentions latency, slow queries, or speed issues
+- Optimizing data fetching, signal calculations, or chart rendering
+- Profiling or benchmarking any part of the trading system
