@@ -108,6 +108,31 @@ def execute_trade(
         return None
 
 
+def get_latest_price(ticker: str) -> Optional[float]:
+    """Return the most recent trade price for *ticker* from Alpaca.
+
+    Alpaca's market-data feed (free with a paper account) returns the last
+    trade at ≤ 2s latency, which is the delay we actually want for stop
+    and target checks — yfinance 5-minute candles lag ≥ 15 minutes and can
+    miss a real-world stop trigger.
+
+    Returns None if the client is not configured or any error occurs; the
+    caller should fall back to yfinance.
+    """
+    if not alpaca_client:
+        return None
+    try:
+        trade = alpaca_client.get_latest_trade(ticker)
+        # SDK returns an object with a .price attribute (float).
+        price = getattr(trade, "price", None) or getattr(trade, "p", None)
+        if price is None:
+            return None
+        return float(price)
+    except Exception as e:
+        logger.debug(f"[Alpaca] get_latest_price({ticker}) failed: {e}")
+        return None
+
+
 def get_account_status() -> Optional[Dict[str, Any]]:
     """Fetches high-level account status from Alpaca (Buying power, equity, etc)."""
     if not alpaca_client:

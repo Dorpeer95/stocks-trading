@@ -56,7 +56,7 @@ from utils.sentiment import (
     cost_tracker,
     get_newsapi_usage,
 )
-from utils.telegram_bot import send_alert
+from utils.telegram_bot import send_alert, is_paused
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +258,10 @@ class AgentLoop:
             combined_size_mod = round(regime_size_mod * safety["size_modifier"], 2)
 
             # Gate: skip new entries entirely if safety gate triggered
-            allow_new_entries = safety["safe_to_enter"]
+            #        OR if user has paused the bot via /pause.
+            allow_new_entries = safety["safe_to_enter"] and not is_paused()
+            if is_paused():
+                logger.warning("Bot is /paused — suppressing new entries this scan")
 
             entry_tickers = {c["ticker"] for c in portfolio_diff.get("new_entries", [])}
             scored_map = {s["ticker"]: s for s in scored if s.get("ticker")}
@@ -504,7 +507,11 @@ class AgentLoop:
                         f"{action['action']}"
                     )
 
-            # 2. Entry trigger checks on watchlist
+            # 2. Entry trigger checks on watchlist — skipped if user has paused
+            if is_paused():
+                logger.debug("Bot paused — skipping intraday entry checks")
+                return
+
             try:
                 open_tickers = {p.get("ticker") for p in _positions_for_stagnation}
                 pending = get_pending_opportunities()
@@ -526,11 +533,20 @@ class AgentLoop:
                         continue
 
                     try:
-                        from utils.data_loader import fetch_price_data
-                        df = fetch_price_data(ticker, period="1d", interval="5m")
-                        if df is None or df.empty:
-                            continue
-                        current = float(df["Close"].iloc[-1])
+                        # Prefer Alpaca realtime; fall back to yfinance 5m if unavailable.
+                        current: Optional[float] = None
+                        try:
+                            from utils.alpaca_broker import get_latest_price
+                            current = get_latest_price(ticker)
+                        except Exception:
+                            current = None
+
+                        if current is None:
+                            from utils.data_loader import fetch_price_data
+                            df = fetch_price_data(ticker, period="1d", interval="5m")
+                            if df is None or df.empty:
+                                continue
+                            current = float(df["Close"].iloc[-1])
 
                         if current >= entry_price:
                             send_alert("entry_signal", {

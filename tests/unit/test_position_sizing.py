@@ -26,44 +26,44 @@ from utils.position_sizing import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestFixedRiskSize:
-    """The DEVELOPMENT_PLAN.md example: $10,000 portfolio, $5 stop → 40 shares."""
+    """With 5bps per-side slippage: $10,000 × 2% = $200 risk, effective stop
+    distance = $5 + 2×($100×0.0005) = $5.10 → 39 shares.
+    """
 
     def test_development_plan_example(self):
-        # $10,000 portfolio, 2% risk = $200. Entry $100, stop $95 → $5 distance
         plan = fixed_risk_size(10_000, 100.0, 95.0)
         assert plan is not None
         assert plan.is_valid
-        assert plan.shares == 40
+        assert plan.shares == 39
 
     def test_risk_amount_matches(self):
         plan = fixed_risk_size(10_000, 100.0, 95.0)
-        # 40 shares × $5 = $200 risk
-        assert plan.risk_amount == 200.0
+        # 39 shares × $5 stop-to-entry = $195 reported risk (slippage is
+        # already baked into the share count, not the displayed risk).
+        assert plan.risk_amount == 195.0
 
     def test_position_value(self):
         plan = fixed_risk_size(10_000, 100.0, 95.0)
-        # 40 shares × $100 = $4,000
-        assert plan.position_value == 4000.0
+        assert plan.position_value == 3900.0
 
     def test_position_pct(self):
         plan = fixed_risk_size(10_000, 100.0, 95.0)
-        # $4,000 / $10,000 = 0.40
-        assert plan.position_pct_portfolio == 0.40
+        assert plan.position_pct_portfolio == 0.39
 
     def test_custom_risk_pct(self):
+        # 1% risk = $100, effective distance $5.10 → 19 shares
         plan = fixed_risk_size(10_000, 100.0, 95.0, risk_pct=0.01)
-        # 1% risk = $100, $5 stop → 20 shares
-        assert plan.shares == 20
+        assert plan.shares == 19
 
     def test_large_stop_distance(self):
-        # $200 risk, entry $100, stop $10 → $90 distance → 2 shares
+        # $200 risk, entry $100, stop $10 → effective distance $90.10 → 2 shares
         plan = fixed_risk_size(10_000, 100.0, 10.0)
         assert plan.shares == 2
 
     def test_stop_too_far_zero_shares(self):
-        # $200 risk, entry $100, stop $0.01 → ~$99.99 distance → 2 shares
+        # $200 risk, entry $100, stop $0.01 → effective distance ≈ $100.09 → 1 share
         plan = fixed_risk_size(10_000, 100.0, 0.01)
-        assert plan.shares == 2
+        assert plan.shares == 1
 
     def test_returns_none_on_zero_portfolio(self):
         assert fixed_risk_size(0, 100.0, 95.0) is None

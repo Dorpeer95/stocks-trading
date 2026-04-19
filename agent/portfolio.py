@@ -72,15 +72,25 @@ def update_positions_intraday() -> List[Dict[str, Any]]:
     for pos in positions:
         ticker = pos.get("ticker", "???")
         try:
-            df = fetch_price_data(ticker, period="1d", interval="5m")
-            if df is None or df.empty:
-                # Fallback to daily if intraday unavailable (pre/post market)
-                df = fetch_price_data(ticker, period="5d", interval="1d")
-            if df is None or df.empty:
-                logger.warning(f"No price data for position {ticker}")
-                continue
+            # Prefer Alpaca's real-time last-trade price for stop/target checks.
+            # yfinance 5-minute candles lag ≥15 min and can miss a true stop
+            # trigger — that risk is unacceptable on real capital.
+            current: Optional[float] = None
+            try:
+                from utils.alpaca_broker import get_latest_price
+                current = get_latest_price(ticker)
+            except Exception as e:
+                logger.debug(f"Alpaca price fetch failed for {ticker}: {e}")
 
-            current = float(df["Close"].iloc[-1])
+            if current is None:
+                df = fetch_price_data(ticker, period="1d", interval="5m")
+                if df is None or df.empty:
+                    # Fallback to daily if intraday unavailable (pre/post market)
+                    df = fetch_price_data(ticker, period="5d", interval="1d")
+                if df is None or df.empty:
+                    logger.warning(f"No price data for position {ticker}")
+                    continue
+                current = float(df["Close"].iloc[-1])
             entry = safe_float(pos.get("entry_price"), current)
             stop = safe_float(pos.get("stop_loss"))
             target = safe_float(pos.get("target_price"))
