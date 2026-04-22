@@ -19,6 +19,12 @@ DEFAULT_MAX_POSITION_PCT = 0.25    # 25% max single position
 DEFAULT_MAX_TOTAL_RISK = 0.16      # 16% max total portfolio risk (8 positions × 2%)
 DEFAULT_CASH_RESERVE_PCT = 0.10    # 10% always in cash
 
+# Realistic frictions — applied to every round trip so position size reflects
+# the actual risk the account takes, not the idealised signal price.
+# Default: 5 bps per side on Alpaca retail = 0.05% × 2 = 0.10% round trip.
+SLIPPAGE_BPS_PER_SIDE = 5          # basis points; 100 bps = 1%
+COMMISSION_PER_TRADE = 0.0         # Alpaca retail is zero-commission
+
 
 @dataclass
 class PositionPlan:
@@ -75,12 +81,19 @@ def fixed_risk_size(
         return None
 
     risk_amount = portfolio_value * risk_pct
-    stop_distance = entry_price - stop_loss
+    stop_distance = entry_price - stop_loss   # clean stop-to-entry distance
 
     if stop_distance <= 0:
         return None
 
-    shares = int(risk_amount / stop_distance)
+    # Effective stop distance used for sizing includes realistic slippage on
+    # entry + exit. Without this we systematically size larger than the real
+    # risk budget because fills rarely land at the signal price. Commissions
+    # (zero on Alpaca retail) are subtracted from the risk budget.
+    slip_per_side = entry_price * (SLIPPAGE_BPS_PER_SIDE / 10_000.0)
+    effective_stop_distance = stop_distance + 2.0 * slip_per_side
+    effective_risk = max(risk_amount - 2.0 * COMMISSION_PER_TRADE, 0.0)
+    shares = int(effective_risk / effective_stop_distance)
 
     if shares <= 0:
         return PositionPlan(
@@ -96,6 +109,8 @@ def fixed_risk_size(
         )
 
     position_value = shares * entry_price
+    # risk_amount reported to the UI is the clean stop-to-entry risk, not the
+    # slippage-inflated number — it's what the user sees on their broker.
     actual_risk = shares * stop_distance
     actual_risk_pct = actual_risk / portfolio_value
     position_pct = position_value / portfolio_value

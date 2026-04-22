@@ -6,11 +6,66 @@ and all alert templates for the stocks-agent.
 """
 
 import asyncio
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Pause state (/pause and /resume commands)
+# ---------------------------------------------------------------------------
+# We persist the flag to disk so a bot restart preserves the user's intent.
+# Source of truth at runtime is the in-memory `_paused` variable; the file
+# is a backup that's re-read on import. Environment variable STOCKS_PAUSE
+# always wins (useful for CI / emergency ops).
+
+_PAUSE_STATE_FILE = Path("logs") / "pause.state"
+_paused: bool = False
+
+
+def _load_pause_state() -> bool:
+    if os.getenv("STOCKS_PAUSE", "").lower() in ("true", "1", "yes"):
+        return True
+    try:
+        if _PAUSE_STATE_FILE.exists():
+            return json.loads(_PAUSE_STATE_FILE.read_text()).get("paused", False)
+    except Exception as e:
+        logger.warning(f"pause state unreadable, defaulting to off: {e}")
+    return False
+
+
+def _save_pause_state(paused: bool) -> None:
+    try:
+        _PAUSE_STATE_FILE.parent.mkdir(exist_ok=True)
+        _PAUSE_STATE_FILE.write_text(json.dumps({"paused": paused}))
+    except Exception as e:
+        logger.warning(f"failed to persist pause state: {e}")
+
+
+def is_paused() -> bool:
+    """Return True if the bot is suppressing new-entry alerts.
+
+    Exit monitoring, /status, and weekly portfolio updates still run.
+    Intraday entry signals and opportunity-driven buy alerts are skipped.
+    """
+    # Re-check env each call so an operator can flip `STOCKS_PAUSE=true` and
+    # restart without waiting for a command to be processed.
+    if os.getenv("STOCKS_PAUSE", "").lower() in ("true", "1", "yes"):
+        return True
+    return _paused
+
+
+def set_paused(paused: bool) -> None:
+    global _paused
+    _paused = bool(paused)
+    _save_pause_state(_paused)
+
+
+# Initialise from persisted state on import
+_paused = _load_pause_state()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -829,9 +884,82 @@ def start_command_listener() -> None:
             ]
             await update.message.reply_text("\n".join(lines))
 
+        async def cmd_status(update, context):
+            """Compact trust-layer status for quick verification."""
+            from datetime import datetime
+
+            from agent.portfolio import get_portfolio_summary
+            from health import check_memory, get_status as health_status
+            try:
+                from agent.persistence import get_portfolio_holdings
+            except Exception:  # pragma: no cover
+                get_portfolio_holdings = None  # type: ignore
+
+            mem = check_memory()
+            summary = get_portfolio_summary() or {}
+
+            holdings = []
+            if get_portfolio_holdings is not None:
+                try:
+                    holdings = get_portfolio_holdings()
+                except Exception as e:
+                    logger.warning(f"/status: holdings fetch failed: {e}")
+
+            lines = [
+                "🟢 stocks-agent — status",
+                f"Paused: {'🟡 YES (new entries suppressed)' if is_paused() else '🟢 no'}",
+                f"Memory: {mem.get('memory_mb', 0):.0f} MB "
+                f"({mem.get('percent', 0):.0f}%) "
+                f"{'⚠️  emergency' if mem.get('emergency_mode') else ''}",
+                f"Last scan:     {health_status('last_scan', 'never')}",
+                f"Next scan:     {health_status('next_weekly_scan', 'unknown')}",
+                f"Last briefing: {health_status('last_morning_briefing', 'never')}",
+                f"Last error:    {health_status('last_error', 'none')}",
+                "",
+                f"Portfolio ({len(holdings)}/8):",
+            ]
+            if holdings:
+                for h in holdings[:8]:
+                    lines.append(
+                        f"  {h.get('ticker', '?'):<6} "
+                        f"conf {h.get('current_confidence') or 0:>4.0f}  "
+                        f"{h.get('status', '?')}"
+                    )
+            else:
+                lines.append("  (no holdings)")
+
+            lines.append("")
+            lines.append(
+                f"Unrealized P&L: ${summary.get('total_unrealized_pnl', 0):,.2f}"
+            )
+            await update.message.reply_text("\n".join(lines))
+
+        async def cmd_pause(update, context):
+            set_paused(True)
+            await update.message.reply_text(
+                "🟡 Bot paused.\n"
+                "• New entry alerts will be suppressed.\n"
+                "• Exit monitoring + stop/target alerts still run.\n"
+                "• Use /resume when you want new entries again."
+            )
+            logger.warning("Bot paused via Telegram /pause")
+
+        async def cmd_resume(update, context):
+            set_paused(False)
+            await update.message.reply_text(
+                "🟢 Bot resumed. New entry alerts are active again."
+            )
+            logger.info("Bot resumed via Telegram /resume")
+
         app.add_handler(CommandHandler("performance", cmd_performance))
-        
-        logger.info("Starting Telegram command listener (/performance)")
+        app.add_handler(CommandHandler("status", cmd_status))
+        app.add_handler(CommandHandler("pause", cmd_pause))
+        app.add_handler(CommandHandler("resume", cmd_resume))
+
+        logger.info(
+            "Starting Telegram command listener "
+            "(/performance, /status, /pause, /resume)"
+        )
         app.run_polling(drop_pending_updates=True)
 
     t = threading.Thread(target=_run_polling, daemon=True, name="telegram-listener")

@@ -23,7 +23,7 @@ Displacement:
 """
 
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.regime_engine import get_cached_regime
@@ -48,6 +48,22 @@ EXIT_WEAK_WEEKS = 2         # ...for this many consecutive weeks
 CONSECUTIVE_NEEDED = 2      # must hit ENTRY_THRESHOLD N weeks in a row to enter
 DISPLACEMENT_GAP = 10       # new stock needs this many points above weakest hold
 MAX_SLOTS = 8               # maximum portfolio size
+ABSENT_GRACE_DAYS = 10      # within this many days of last_scored_at, treat a
+                            # missing scan as a transient data issue and keep
+                            # prev confidence. Beyond this, we can't see the
+                            # stock anymore so force a WATCH transition.
+
+
+def _days_between(earlier_iso: Optional[str], later_iso: str) -> Optional[int]:
+    """Return integer day delta (later - earlier) or None if either is unparseable."""
+    if not earlier_iso:
+        return None
+    try:
+        earlier = datetime.fromisoformat(str(earlier_iso)[:10]).date()
+        later = datetime.fromisoformat(str(later_iso)[:10]).date()
+        return (later - earlier).days
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -145,15 +161,32 @@ def _update_existing_holdings(
         prev_status = holding["status"]
         prev_conf = holding.get("current_confidence", 0) or 0
 
-        # Get fresh confidence — use scored_map if available, else keep prev
+        # Get fresh confidence — use scored_map if available, else reason about absence.
         if ticker in scored_map:
             new_conf = safe_float(scored_map[ticker].get("confidence"))
             sub_scores = scored_map[ticker].get("sub_scores", {})
             setup_type = scored_map[ticker].get("setup_type", "")
             gpt_vetoed = scored_map[ticker].get("gpt_vetoed", False)
         else:
-            # Stock didn't pass scanner this week — treat as weakened signal
-            new_conf = max(0, prev_conf - 8)  # decay when absent from scan
+            # Absent from this week's scan. Policy:
+            #   • Within ABSENT_GRACE_DAYS of last_scored_at → preserve prev_conf.
+            #     One missed scan is usually a transient data/filter glitch, not
+            #     a real signal change. Arbitrary decay here created false WATCH
+            #     transitions and churned the portfolio.
+            #   • Beyond ABSENT_GRACE_DAYS → force a WATCH transition by capping
+            #     confidence strictly below STAY_THRESHOLD. We genuinely can't
+            #     see the stock anymore and should not pretend the thesis holds.
+            days_absent = _days_between(
+                holding.get("last_scored_at"), scan_date,
+            )
+            if days_absent is not None and days_absent > ABSENT_GRACE_DAYS:
+                new_conf = min(prev_conf, STAY_THRESHOLD - 1)
+                logger.info(
+                    f"{ticker}: absent {days_absent}d since last scan — "
+                    f"capping conf at {new_conf:.0f} to force WATCH"
+                )
+            else:
+                new_conf = prev_conf  # grace period: preserve previous score
             sub_scores = holding.get("sub_scores", {})
             setup_type = holding.get("setup_type", "")
             gpt_vetoed = False
