@@ -108,9 +108,9 @@ class TestFullPositionPlan:
         plan = full_position_plan(10_000, 100.0, 95.0, 110.0)
         assert plan is not None
         assert plan.is_valid
-        assert plan.shares == 40
-        assert plan.risk_amount == 200.0
-        assert plan.reward_amount == 400.0
+        assert plan.shares == 39
+        assert plan.risk_amount == 195.0
+        assert plan.reward_amount == 390.0
         assert plan.risk_reward_ratio == 2.0
 
     def test_returns_none_on_bad_input(self):

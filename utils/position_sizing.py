@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DEFAULT_RISK_PER_TRADE = 0.02      # 2% of portfolio
 DEFAULT_MAX_POSITION_PCT = 0.25    # 25% max single position
-DEFAULT_MAX_TOTAL_RISK = 0.16      # 16% max total portfolio risk (8 positions × 2%)
+DEFAULT_MAX_TOTAL_RISK = 0.06      # 6% max total portfolio risk
 DEFAULT_CASH_RESERVE_PCT = 0.10    # 10% always in cash
 
 # Realistic frictions — applied to every round trip so position size reflects

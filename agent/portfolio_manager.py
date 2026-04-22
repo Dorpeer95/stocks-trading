@@ -250,7 +250,7 @@ def _update_existing_holdings(
                 )
 
         elif prev_status == "watch":
-            weak_weeks = (holding.get("consecutive_weak_weeks") or 1) + 1
+            weak_weeks = (holding.get("consecutive_weak_weeks") if holding.get("consecutive_weak_weeks") is not None else 0) + 1
 
             if new_conf >= STAY_THRESHOLD:
                 # Signal recovered — back to active
